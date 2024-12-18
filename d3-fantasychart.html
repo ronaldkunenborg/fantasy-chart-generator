@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fantasy Map</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/noisejs@2.1.0"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+        }
+    </style>
+</head>
+<body>
+    <script>
+        // Instellingen
+        const width = window.innerWidth;
+        const height = window.innerHeight;
+        const tileSize = 32; // Grootte van een tile
+
+        // Canvas setup
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+        document.body.appendChild(canvas);
+        const context = canvas.getContext("2d");
+
+        // Noise.js setup
+        const noise = new Noise(Math.random());
+
+        // Terreinkleuren
+        const terrainColors = {
+            water: "#0000ff",
+            grassland: "#7cfc00",
+            forest: "#228b22"
+        };
+
+        // Functie voor terrein generatie
+        function generateTerrain(x, y) {
+            const value = noise.simplex2(x / 100, y / 100);
+            if (value < -0.2) return "water";
+            if (value < 0.4) return "grassland";
+            return "forest";
+        }
+
+        // Teken een tile
+        function drawTile(x, y, size) {
+            const terrain = generateTerrain(x, y);
+            context.fillStyle = terrainColors[terrain];
+            context.fillRect(x, y, size, size);
+        }
+
+        // Bereken zichtbare tiles
+        function computeTiles(transform) {
+            const scale = transform.k;
+            const translateX = -transform.x / scale;
+            const translateY = -transform.y / scale;
+
+            const startX = Math.floor(translateX / tileSize) * tileSize;
+            const startY = Math.floor(translateY / tileSize) * tileSize;
+
+            const tiles = [];
+            for (let x = startX; x < startX + width / scale; x += tileSize) {
+                for (let y = startY; y < startY + height / scale; y += tileSize) {
+                    tiles.push({ x, y, size: tileSize });
+                }
+            }
+            return tiles;
+        }
+
+        // Voeg zoom toe
+        const zoomBehavior = d3.zoom()
+            .scaleExtent([1, 8])
+            .on("zoom", ({ transform }) => {
+                context.clearRect(0, 0, width, height);
+                const tiles = computeTiles(transform);
+                tiles.forEach(tile => {
+                    drawTile(tile.x * transform.k, tile.y * transform.k, tile.size * transform.k);
+                });
+            });
+
+        d3.select(canvas).call(zoomBehavior);
+
+        // Initialiseer eerste weergave
+        const initialTransform = d3.zoomIdentity;
+        const tiles = computeTiles(initialTransform);
+        tiles.forEach(tile => {
+            drawTile(tile.x, tile.y, tile.size);
+        });
+    </script>
+</body>
+</html>
