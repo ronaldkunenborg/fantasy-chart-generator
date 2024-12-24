@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fantasy Map</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <!-- <script src="https://cdn.jsdelivr.net/npm/simplex-noise/simplex-noise.min.js"></script> -->
+    <script src="perlin.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            overflow: hidden;
+        }
+        .tooltip {
+            position: absolute;
+            text-align: center;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            border-radius: 4px;
+            pointer-events: none;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div id="chart"></div>
+    <script>
+        // Map settings
+        const width = 800;
+        const height = 600;
+        const gridSize = 20; // Size of each grid cell
+        const terrainTypes = ["Water", "Forest", "Mountain", "Plain"];
+        const colors = {
+            Water: "#1f78b4",
+            Forest: "#33a02c",
+            Mountain: "#6a3d9a",
+            Plain: "#b2df8a",
+        };
+
+        // Tooltip
+        const tooltip = d3.select("body")
+            .append("div")
+            .attr("class", "tooltip")
+            .style("opacity", 0);
+
+        // Noise function
+        // const noise = new SimplexNoise(Math.random);
+        // const noisefn = noise.simplex2;
+
+        // Generate terrain data
+        const generateTerrain = () => {
+            const data = [];
+            for (let y = 0; y < height / gridSize; y++) {
+                for (let x = 0; x < width / gridSize; x++) {
+                    const noiseValue = noise.simplex2(x / 10, y / 10, Math.random(10));
+                    let terrain;
+                    if (noiseValue < -0.3) terrain = "Water";
+                    else if (noiseValue < 0.1) terrain = "Plain";
+                    else if (noiseValue < 0.5) terrain = "Forest";
+                    else terrain = "Mountain";
+                    data.push({ x, y, terrain });
+                }
+            }
+            return data;
+        };
+
+        const terrainData = generateTerrain();
+
+        // SVG canvas
+        const svg = d3.select("#chart")
+            .append("svg")
+            .attr("width", width)
+            .attr("height", height);
+
+        // Draw the terrain
+        svg.selectAll("rect")
+            .data(terrainData)
+            .enter()
+            .append("rect")
+            .attr("x", d => d.x * gridSize)
+            .attr("y", d => d.y * gridSize)
+            .attr("width", gridSize)
+            .attr("height", gridSize)
+            .attr("fill", d => colors[d.terrain])
+            .on("mouseover", function (event, d) {
+                tooltip.style("opacity", 1)
+                    .html(`Terrain: ${d.terrain}`)
+                    .style("left", (event.pageX + 10) + "px")
+                    .style("top", (event.pageY - 10) + "px");
+            })
+            .on("mouseout", function () {
+                tooltip.style("opacity", 0);
+            });
+
+        // Legend
+        const legend = svg.append("g")
+            .attr("transform", `translate(${width - 150}, 50)`);
+
+        legend.selectAll("rect")
+            .data(terrainTypes)
+            .enter()
+            .append("rect")
+            .attr("x", 0)
+            .attr("y", (d, i) => i * 25)
+            .attr("width", 20)
+            .attr("height", 20)
+            .attr("fill", d => colors[d]);
+
+        legend.selectAll("text")
+            .data(terrainTypes)
+            .enter()
+            .append("text")
+            .attr("x", 30)
+            .attr("y", (d, i) => i * 25 + 15)
+            .text(d => d)
+            .attr("font-size", "14px");
+    </script>
+</body>
+</html>

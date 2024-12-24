@@ -5,11 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Fantasy Map</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/noisejs@2.1.0"></script>
+    <script src="perlin.js"></script>
     <style>
         body {
             margin: 0;
             overflow: hidden;
+            background-color: #f0f8ff; /* Subtiele lichtblauwe achtergrond */ 
         }
     </style>
 </head>
@@ -28,66 +29,110 @@
         const context = canvas.getContext("2d");
 
         // Noise.js setup
-        const noise = new Noise(Math.random());
+        // const noise = new Noise(Math.random());
 
         // Terreinkleuren
         const terrainColors = {
             water: "#0000ff",
+            beach: "",
             grassland: "#7cfc00",
-            forest: "#228b22"
+            forest: "#228b22",
+            mountain: "#BBCCDD",
+            snow: "#FFFFFF"
         };
 
         // Functie voor terrein generatie
         function generateTerrain(x, y) {
             const value = noise.simplex2(x / 100, y / 100);
-            if (value < -0.2) return "water";
-            if (value < 0.4) return "grassland";
-            return "forest";
+            // console.log(value);
+            // if (value < -0.2) return "water";
+            if (value < -0.2) return `rgba(0, 0, ${Math.floor(200 + value * 55)}, 1)`;
+            if (value < 0.1) return "beach";
+            if (value < 0.3) return "grassland";
+            if (value < 0.5) return "forest";
+            if (value < 0.8) return "mountain";
+            return "snow";
         }
 
         // Teken een tile
         function drawTile(x, y, size) {
             const terrain = generateTerrain(x, y);
+            // console.log("terrain: " + terrain);
             context.fillStyle = terrainColors[terrain];
             context.fillRect(x, y, size, size);
         }
 
         // Bereken zichtbare tiles
         function computeTiles(transform) {
-            const scale = transform.k;
+            const scale = transform.k; // De huidige schaal van de zoom
             const translateX = -transform.x / scale;
             const translateY = -transform.y / scale;
 
+            // Bereken de zichtbare regio gebaseerd op de nieuwe canvas-afmetingen
             const startX = Math.floor(translateX / tileSize) * tileSize;
             const startY = Math.floor(translateY / tileSize) * tileSize;
 
+            // Dynamisch de actuele breedte en hoogte van het canvas ophalen
+            const currentWidth = canvas.width;
+            const currentHeight = canvas.height;
+
+            const endX = startX + Math.ceil(currentWidth / scale);
+            const endY = startY + Math.ceil(currentHeight / scale);
+
+            // console.log('startX: ' + startX + ', endX: ' + endX);
+
             const tiles = [];
-            for (let x = startX; x < startX + width / scale; x += tileSize) {
-                for (let y = startY; y < startY + height / scale; y += tileSize) {
+            for (let x = startX; x < endX; x += tileSize) {
+                for (let y = startY; y < endY; y += tileSize) {
                     tiles.push({ x, y, size: tileSize });
                 }
             }
             return tiles;
         }
 
+
+        // Hertekenfunctie
+        function redraw(transform) {
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            const tiles = computeTiles(transform);
+            tiles.forEach(tile => {
+                drawTile(tile.x * transform.k, tile.y * transform.k, tile.size * transform.k);
+            });
+        }
+
         // Voeg zoom toe
         const zoomBehavior = d3.zoom()
             .scaleExtent([1, 8])
             .on("zoom", ({ transform }) => {
-                context.clearRect(0, 0, width, height);
-                const tiles = computeTiles(transform);
-                tiles.forEach(tile => {
-                    drawTile(tile.x * transform.k, tile.y * transform.k, tile.size * transform.k);
+                redraw(transform);
                 });
-            });
 
         d3.select(canvas).call(zoomBehavior);
 
         // Initialiseer eerste weergave
         const initialTransform = d3.zoomIdentity;
-        const tiles = computeTiles(initialTransform);
-        tiles.forEach(tile => {
-            drawTile(tile.x, tile.y, tile.size);
+        redraw(initialTransform);
+
+        // Declareer resizeTimeout buiten de eventlistener
+        let resizeTimeout;
+
+        // bij resize hertekenen we de tiles
+        window.addEventListener("resize", () => {
+            // Clear de bestaande timer als deze al bestaat
+            if (resizeTimeout) {
+                clearTimeout(resizeTimeout);
+            }
+
+            // Start een nieuwe timer
+            resizeTimeout = setTimeout(() => {
+                console.log("Resize klaar, hertekenen!");
+                canvas.width = window.innerWidth;
+                canvas.height = window.innerHeight;
+
+                // Herteken de tiles of voer andere acties uit
+                const currentTransform = d3.zoomTransform(canvas);
+                redraw(currentTransform);
+            }, 100); // Stel de debounce-tijd in (bijvoorbeeld 100 ms)
         });
     </script>
 </body>
