@@ -16,28 +16,61 @@
 </head>
 <body>
     <script>
-        // Instellingen
-        const width = window.innerWidth;
-        const height = window.innerHeight;
-        const tileSize = 32; // Grootte van een tile
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        // Description
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        //
+        // Intent: Create a fantasy map using Perlin noise.
+        //  
+        // The map will consist of different terrains: water, beach, grassland, forest, mountain, and snow.
+        // The map will be generated using Perlin noise, with the terrain type determined by the noise value.
+        // The map will be *finite* in size, with the player starting at the center of the map.
+        // The edge of the map will be at x = 0, y = 0 and player_starting_position_x*2, player_starting_position_y*2 respectively.
+        // Once you reach the edge, the terrain will turn into beach (1 tile at the edge),
+        // then water for negative x or y values, or for values larger than 2*player_x or 2*player_y.
+        // 
+        // At the start, the player is at the center of the map.
+        // The player will be able to move around the map by pressing the WASD keys.
+        // The player will not be able to move into the water.
+        // The player will be able to move into the beach, but only if the player is moving away from the water.
+        // The player will be able to move into the grassland, forest, mountain, and snow.
+        // The player will not be able to move off the map.
 
-        // Canvas setup
-        const canvas = document.createElement("canvas");
-        canvas.width = width;
-        canvas.height = height;
-        document.body.appendChild(canvas);
-        const context = canvas.getContext("2d");
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        // Settings
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 
-        // Bereken het maximum aantal tiles in x- en y-richting
-        let nr_of_tiles_x = Math.floor(canvas.width / tileSize);
-        let nr_of_tiles_y = Math.floor(canvas.height / tileSize);
-        console.log(`nr_of_tiles_x: ${nr_of_tiles_x}, nr_of_tiles_y: ${nr_of_tiles_y}`);
+        // Tile settings
+        const TILE_SIZE = 32;         // Size of tile in pixels
+        const MOVE_AMOUNT = TILE_SIZE; // Nr of pixels to move when a key is pressed
+        const NOISE_ZOOM = 100;       // Zoom level for the noise function. Higher zoom gives less variation in terrain.
+
+        // Map settings
+        const PLAYER_STARTING_POSITION_X = 10000; // Player starting x-coordinate
+        const PLAYER_STARTING_POSITION_Y = 10000; // Player starting y-coordinate
+        const MAP_X_MIN = 0;         // Top x-coordinate of the map
+        const MAP_Y_MIN = 0;         // Top y-coordinate of the map
+        const MAP_X_MAX = PLAYER_STARTING_POSITION_X * 2; // Bottom x-coordinate of the map
+        const MAP_Y_MAX  = PLAYER_STARTING_POSITION_Y * 2; // Bottom y-coordinate of the map
+
+        let g_player_x = PLAYER_STARTING_POSITION_X;        // Current player x-coordinate.
+        let g_player_y = PLAYER_STARTING_POSITION_X;        // Current player y-coordinate
+
+        // Initialize the variables that hold the number of tiles that will fit in the canvas,
+        //  given current TILE_SIZE, canvas width and height and zoom level.
+        // This will have to be changed every time the screen changes in size, something moves, or the zoom level changes.
+        let g_nr_of_tiles_x = 0;
+        let g_nr_of_tiles_y = 0;
 
         // Noise.js setup
-        noise.seed(12345); // Use a fixed seed for consistency
+        // The noise object is a global object that can be used to generate Perlin noise.
+        // The seed is set to a fixed value for consistency.
+        noise.seed(12345);
 
-        // Terreinkleuren
-        const terrainColors = {
+        // Terrain colors for each terrain type
+        // Later, you might replace this with bitmaps or more complex textures.
+        const TERRAIN_COLORS = {
+            ocean: "#1f7880", // Updated ocean color
             water: "#1f78b4",
             beach: "#f4d78c", // Updated beach color
             grassland: "#7cfc00",
@@ -45,17 +78,33 @@
             forest: "#228b22",
             forest2: "#33a02c",
             mountain: "#6a3d9a",
-            mountain2: "#BBCCDD",
-            snow: "#FFFFFF"
+            mountain2: "#bbccdd",
+            snow: "#ffffff"
         };
 
-        // Functie voor terrein generatie
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        // Functions
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+
+        // Function for terrain generation
+        // This function generates a terrain type based on the noise value at a given (x, y) coordinate.
         // Please read https://www.redblobgames.com/maps/terrain-from-noise/ for ideas on what I am trying to do here.
         function generateTerrain(x, y) {
-            const value = noise.simplex2(x / 100, y / 100);
+            // first check if the (x,y) terrain is at the edge of the map. This should be beach.
+            if (x <= MAP_X_MIN || x >= MAP_X_MAX || y <= MAP_Y_MIN || y >= MAP_Y_MAX) {
+                if (x == MAP_X_MIN || x == MAP_X_MAX || y == MAP_Y_MIN || y == MAP_Y_MAX) {
+                    // Terrain at the edge of the map is beach
+                    return "beach";
+                } else {    
+                    // Terrain outside the map is water
+                    return "ocean";
+                }
+            }
+            // for all other coordinates, calculate the terrain based on the noise value
+            const value = noise.simplex2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use simplex2 for 2D noise
             // console.log(`x: ${x}, y: ${y}, value: ${value}`);
-            // if (value < -0.2) return "water";
-            if (value < -0.2) return `rgba(0, 0, ${Math.floor(200 + value * 55)}, 1)`; // Water color
+            if (value < -0.2) return "water";
             if (value < 0.1) return "beach";
             if (value < 0.3) return "grassland";
             if (value < 0.5) return "forest";
@@ -63,48 +112,74 @@
             return "snow";
         }
 
-        // Teken een tile
-        function drawTile(x, y, size) {
-            const terrain = generateTerrain(x, y);
-            // console.log("terrain: " + terrain);
-            context.fillStyle = terrainColors[terrain];
+        // Function for turning a terrain tile into graphical output
+        // At his point we assume the x and y are the top-left corner of the tile, and the size is the size of the tile.
+        // Also, the coordinates are already transformed by the zoom level and translation.
+        function drawTile(terrain, x, y, size) {
+            switch(terrain) {
+                case "ocean":
+                    context.fillStyle = `rgba(30, 125, ${Math.floor(128 + Math.random()*72)}, 1)`; // ocean coloring
+                    break;
+                case "water":
+                    context.fillStyle = `rgba(30, 125, ${Math.floor(200 + Math.random()*55)}, 1)`; // Updated water color
+                    break;
+                default:
+                context.fillStyle = TERRAIN_COLORS[terrain];
+                }
             context.fillRect(x, y, size, size);
         }
 
-        // Bereken zichtbare tiles
-        // Je moet hier eigenlijk terugrekenen van scale en translate naar de originele x en y
-        // ...
+        // Calculate the maximum nr of tiles in x- en y-directions that will be visible for the current zoom level and canvas size.
+        // This will be used in the redraw function to determine which tiles to draw.
+        // Note that the number of tiles will be rounded down to the nearest integer, so you will need to take partial tiles into account
+        //  when drawing the tiles.
+        function calculateNrOfTiles(transform) {
+            const scale = transform.k;
+            g_nr_of_tiles_x = Math.floor(canvas.width / TILE_SIZE / scale);
+            g_nr_of_tiles_y = Math.floor(canvas.height / TILE_SIZE / scale);
+        }
+
+
+        // This function calculates the tiles that are visible on the screen, based on the current zoom level and player position.
+        // It returns an array of tiles that should be drawn on the screen.
+        // The preconditions are:
+        //      - the canvas width and height are set correctly (even after a resize)
+        //      - the current position of the player has been set in g_player_x and g_player_y
+        //      - the current zoom level has been set in currentTransform.k
         function computeTiles(transform) {
-            const scale = transform.k; // De huidige schaal van de zoom: 1 is de standaardgrootte, 8 het maximum
+            // Scale is the zoom level (1-8). This is interpolated on a quadratic curve: 1, 1.13, 2, ..., 4, ..., 8.
+            // TranslateX and translateY are the translations in x and y directions.
+            // The translation is a movement in the direction opposite to the movement of the player,
+            //  hence the negative values for translateX and translateY.
+            const scale = transform.k; 
             const translateX = -transform.x / scale;
             const translateY = -transform.y / scale;
+            // console.log(`translateX: ${translateX}, translateY: ${translateY}, scale: ${scale}`);
 
-            console.log(`translateX: ${translateX}, translateY: ${translateY}, scale: ${scale}`);
-
-            // Bereken de zichtbare regio gebaseerd op de nieuwe canvas-afmetingen
-            const startX = Math.floor(translateX / tileSize) * tileSize;
-            const startY = Math.floor(translateY / tileSize) * tileSize;
-
-            // Dynamisch de actuele breedte en hoogte van het canvas ophalen
             const currentWidth = canvas.width;
             const currentHeight = canvas.height;
 
-            const endX = startX + Math.ceil(currentWidth / scale);
-            const endY = startY + Math.ceil(currentHeight / scale);
+            // There are g_nr_of_tiles_x tiles visible in the x-direction, and g_nr_of_tiles_y tiles visible in the y-direction.
+
+
+
 
             const tiles = [];
             // Loop door de tiles en voeg ze toe aan de array
             // Let er op dat de tiles worden getekend op de originele x en y, niet op de getransformeerde x en y
-            // Let er ook op dat de tileSize wordt vermenigvuldigd met de schaal, zodat de tiles groter worden bij inzoomen
-            for (let x = startX; x < endX; x += tileSize * scale) {
-                for (let y = startY; y < endY; y += tileSize * scale) {
-                    tiles.push({ x, y, size: tileSize * scale });
+            // Let er ook op dat de TILE_SIZE wordt vermenigvuldigd met de schaal, zodat de tiles groter worden bij inzoomen
+            for (let x = startX; x < endX; x += TILE_SIZE * scale) {
+                for (let y = startY; y < endY; y += TILE_SIZE * scale) {
+                    const terrain = generateTerrain(x, y);
+                    tiles.push({ terrain, x, y, size: TILE_SIZE * scale });
                 }
             }
             return tiles;
         }
 
-        // Hertekenfunctie
+
+
+        // The redraw function will clear the canvas and draw the tiles that are visible on the screen.
         function redraw(transform) {
             context.clearRect(0, 0, canvas.width, canvas.height);
             const tiles = computeTiles(transform);
@@ -112,55 +187,71 @@
                 // const transformedX = tile.x * transform.k + transform.x;
                 // const transformedY = tile.y * transform.k + transform.y;
                 // drawTile(transformedX, transformedY, tile.size * transform.k);
-                drawTile(tile.x, tile.y, tile.size);
+                drawTile(tile.terrain, tile.x, tile.y, tile.size);
             });
         }
 
-        // Voeg zoom toe
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        // Create canvas 
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+
+        //
+        // Now let's set up the canvas and the zoom behavior
+        // and use those functions we created earlier
+        //
+
+        // Canvas setup
+        // Create the canvas and context elements, and append the canvas to the HTML body.
+        const canvas = document.createElement("canvas");
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        document.body.appendChild(canvas);
+        const context = canvas.getContext("2d");
+
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        // Create the event listeners for resize, zoom, and keydown/keyup on the canvas and the window
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // Add the behaviour to apply zooming to the canvas
+        // The zoom behavior is defined using d3.zoom() and applied to the canvas element.
+
+        // Set the initial zoom level
+        let currentTransform = d3.zoomIdentity;
+
         const zoomBehavior = d3.zoom()
             .scaleExtent([1, 8])
             .on("zoom", ({ transform }) => {
-                console.log('transform: ', transform.toString());
-
-                // Bereken het maximum aantal tiles in x- en y-richting na de zoom
-                const scale = transform.k;
-                nr_of_tiles_x = Math.floor(canvas.width / tileSize / scale);
-                nr_of_tiles_y = Math.floor(canvas.height / tileSize / scale);
-                console.log(`Na zoom: nr_of_tiles_x: ${nr_of_tiles_x}, nr_of_tiles_y: ${nr_of_tiles_y}`);
-
+                // console.log('transform: ', transform.toString());
                 currentTransform = transform; // Update currentTransform globally
+                calculateNrOfTiles(transform);
                 redraw(transform);
             });
-
+        // Apply the zoom behavior to the canvas
         d3.select(canvas).call(zoomBehavior);
 
-        // Initialiseer eerste weergave
-        let currentTransform = d3.zoomIdentity;
-        redraw(currentTransform);
+        // Add a resize listener. This will redraw the tiles when the window is resized.
+        // It also debounces the resize event, so it doesn't redraw the tiles too often, using a timer with a short timeout.
 
-        // Declareer resizeTimeout buiten de eventlistener
+        // Declare resizeTimeout outside the eventlistener. Keep it undefined for now.
         let resizeTimeout;
 
-        // bij resize hertekenen we de tiles
+        // Add the event listener for the resize. It redraws the tiles when the window is resized.
         window.addEventListener("resize", () => {
-            // Clear de bestaande timer als deze al bestaat
+            // Clear the existing timer if there is one already
             if (resizeTimeout) {
                 clearTimeout(resizeTimeout);
             }
 
-            // Start een nieuwe timer
+            // Start a new timer
             resizeTimeout = setTimeout(() => {
-                console.log("Resize klaar, hertekenen!");
                 canvas.width = window.innerWidth;
                 canvas.height = window.innerHeight;
 
-                // Bereken het maximum aantal tiles in x- en y-richting na de resize
-                nr_of_tiles_x = Math.floor(canvas.width / tileSize);
-                nr_of_tiles_y = Math.floor(canvas.height / tileSize);
-                console.log(`Na resize: nr_of_tiles_x: ${nr_of_tiles_x}, nr_of_tiles_y: ${nr_of_tiles_y}`);
-
-                // Herteken de tiles of voer andere acties uit
-                currentTransform = d3.zoomTransform(canvas);
+                // Reapply the old currentTransform after resizing
+                // This prevents the map from jumping around when resizing
+                d3.select(canvas).call(zoomBehavior.transform, currentTransform);
+                calculateNrOfTiles(currentTransform);
                 redraw(currentTransform);
             }, 100); // Stel de debounce-tijd in (bijvoorbeeld 100 ms)
         });
@@ -168,7 +259,7 @@
         // Track the state of the keys
         const keys = {};
 
-        // Voeg keydown event listeners toe voor WASD-toetsen
+        // Add keydown event listeners for the WASD-keys keyup and keydown events, so you can keep pressing the keys to move the player.
         window.addEventListener("keydown", (event) => {
             keys[event.key] = true;
             handleMovement();
@@ -179,35 +270,43 @@
         });
 
         function handleMovement() {
-            const moveAmount = tileSize; // Aantal pixels om te verplaatsen per toetsdruk
             let moved = false;
 
             if (keys["w"]) {
-                currentTransform = currentTransform.translate(0, -moveAmount / currentTransform.k);
+                currentTransform = currentTransform.translate(0, -MOVE_AMOUNT / currentTransform.k);
                 moved = true;
             }
             if (keys["a"]) {
-                currentTransform = currentTransform.translate(-moveAmount / currentTransform.k, 0);
+                currentTransform = currentTransform.translate(-MOVE_AMOUNT / currentTransform.k, 0);
                 moved = true;
             }
             if (keys["s"]) {
-                currentTransform = currentTransform.translate(0, moveAmount / currentTransform.k);
+                currentTransform = currentTransform.translate(0, MOVE_AMOUNT / currentTransform.k);
                 moved = true;
             }
             if (keys["d"]) {
-                currentTransform = currentTransform.translate(moveAmount / currentTransform.k, 0);
+                currentTransform = currentTransform.translate(MOVE_AMOUNT / currentTransform.k, 0);
                 moved = true;
             }
 
             if (moved) {
                 d3.select(canvas).call(zoomBehavior.transform, currentTransform);
+                calculateNrOfTiles(currentTransform);
                 redraw(currentTransform);
             }
         }
 
-        // Ensure the canvas has focus
+        //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
+        // Finish up and show the initial screen
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+        // Ensure the canvas has focus so our keys actually apply to the terrain
         canvas.tabIndex = 1; // Make the canvas focusable
         canvas.focus();
+
+        // Draw the initial screen
+        calculateNrOfTiles(currentTransform);
+        redraw(currentTransform);
     </script>
 </body>
 </html>
