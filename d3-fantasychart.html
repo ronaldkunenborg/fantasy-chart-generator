@@ -44,6 +44,9 @@
         const TILE_SIZE = 8;         // Size of tile in pixels
         const MOVE_AMOUNT = TILE_SIZE; // Nr of pixels to move when a key is pressed
         const NOISE_ZOOM = 10;       // Zoom level for the noise function. Higher zoom gives less variation in terrain.
+        const USE_TERRAIN_CACHE = true; // Toggle terrain cache for performance testing
+        const USE_RANDOM_WATER_COLOR = false; // Toggle random water/ocean shading
+        const USE_ALLOCATION_FREE_REDRAW = true; // Toggle draw path that avoids per-frame tile-object allocation
 
         // Map settings
         const PLAYER_STARTING_POSITION_X = 10000; // Player starting x-coordinate
@@ -76,6 +79,7 @@
         // This will have to be changed every time the screen changes in size, something moves, or the zoom level changes.
         let g_nr_of_tiles_x = 0;
         let g_nr_of_tiles_y = 0;
+        const terrainCache = new Map();
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Functions
@@ -85,26 +89,37 @@
         // This function generates a terrain type based on the noise value at a given (x, y) coordinate.
         // Please read https://www.redblobgames.com/maps/terrain-from-noise/ for ideas on what I am trying to do here.
         function generateTerrain(x, y) {
+            const cacheKey = `${x},${y}`;
+            if (USE_TERRAIN_CACHE && terrainCache.has(cacheKey)) {
+                return terrainCache.get(cacheKey);
+            }
+
+            let terrain;
             // first check if the (x,y) terrain is at the edge of the map. This should be beach.
             if (x <= MAP_X_MIN || x >= MAP_X_MAX || y <= MAP_Y_MIN || y >= MAP_Y_MAX) {
                 if (x == MAP_X_MIN || x == MAP_X_MAX || y == MAP_Y_MIN || y == MAP_Y_MAX) {
                     // Terrain at the edge of the map is beach
-                    return "beach";
+                    terrain = "beach";
                 } else {    
                     // Terrain outside the map is water
-                    return "ocean";
+                    terrain = "ocean";
                 }
+            } else {
+                // for all other coordinates, calculate the terrain based on the noise value
+                // const value = noise.simplex2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use simplex2 for 2D noise
+                const value = noise.perlin2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use perlin2 for 2D noise
+                if (value < -0.2) terrain = "water";
+                else if (value < 0.1) terrain = "beach";
+                else if (value < 0.3) terrain = "grassland";
+                else if (value < 0.5) terrain = "forest";
+                else if (value < 0.8) terrain = "mountain";
+                else terrain = "snow";
             }
-            // for all other coordinates, calculate the terrain based on the noise value
-            // const value = noise.simplex2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use simplex2 for 2D noise
-            const value = noise.perlin2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use perlin2 for 2D noise
-            // console.log(`x: ${x}, y: ${y}, value: ${value}`);
-            if (value < -0.2) return "water";
-            if (value < 0.1) return "beach";
-            if (value < 0.3) return "grassland";
-            if (value < 0.5) return "forest";
-            if (value < 0.8) return "mountain";
-            return "snow";
+
+            if (USE_TERRAIN_CACHE) {
+                terrainCache.set(cacheKey, terrain);
+            }
+            return terrain;
         }
 
         // Function for turning a terrain tile into graphical output
@@ -114,10 +129,18 @@
         function drawTile(terrain, x, y, size) {
             switch(terrain) {
                 case "ocean":
-                    context.fillStyle = `rgba(30, 125, ${Math.floor(128 + Math.random()*72)}, 1)`; // ocean coloring
+                    if (USE_RANDOM_WATER_COLOR) {
+                        context.fillStyle = `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`;
+                    } else {
+                        context.fillStyle = TERRAIN_COLORS.ocean;
+                    }
                     break;
                 case "water":
-                    context.fillStyle = `rgba(30, 125, ${Math.floor(200 + Math.random()*55)}, 1)`; // Updated water color
+                    if (USE_RANDOM_WATER_COLOR) {
+                        context.fillStyle = `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`;
+                    } else {
+                        context.fillStyle = TERRAIN_COLORS.water;
+                    }
                     break;
                 default:
                 context.fillStyle = TERRAIN_COLORS[terrain];
@@ -141,22 +164,17 @@
             // TranslateX and translateY are the translations in x and y directions.
             // The translation is a movement in the direction opposite to the movement of the player,
             //  hence the negative values for translateX and translateY.
-            console.log(`transform: ${transform}`);
-
             // Scale is the zoom level (1-8). This is interpolated on a quadratic curve: 1, 1.13, 2, ..., 4, ..., 8.
             const scale = transform.k; 
             const translateX = transform.x / scale;
             const translateY = transform.y / scale;
-            console.log(`translateX: ${translateX}, translateY: ${translateY}, scale: ${scale}`);
 
             // Calculate the new player x- and y-coordinates. If the movement is smaller than a single tile, set movement to 0 for now.
             // later, we may want to allow the player to move a fraction of a tile.
             // the translation will continually update, so the player position is the starting position plus the translation.
 
-            console.log(`before: g_player_x: ${g_player_x}, g_player_y: ${g_player_y}`);
             g_player_x = PLAYER_STARTING_POSITION_X + Math.floor(translateX / TILE_SIZE);        // Current player x-coordinate.
             g_player_y = PLAYER_STARTING_POSITION_X + Math.floor(translateY / TILE_SIZE);        // Current player y-coordinate
-            console.log(`after: g_player_x: ${g_player_x}, g_player_y: ${g_player_y}`);
         }
 
 
@@ -174,15 +192,12 @@
             const currentWidth = canvas.width;
             const currentHeight = canvas.height;
 
-            console.log(g_nr_of_tiles_x, g_nr_of_tiles_y, currentWidth, currentHeight); 
-
             // Calculate how many tiles fit on the screen
             // Add an extra tile each way to prevent flickering when moving and in case it is needed for the edge tiles
             const left_tile_x = g_player_x - Math.floor(g_nr_of_tiles_x / 2) - 1;
             const right_tile_x = g_player_x + Math.floor(g_nr_of_tiles_x / 2) + 1;
             const top_tile_y = g_player_y - Math.floor(g_nr_of_tiles_y / 2) - 1;
             const bottom_tile_y = g_player_y + Math.floor(g_nr_of_tiles_y / 2) + 1;            
-            console.log(`left_tile_x: ${left_tile_x}, right_tile_x: ${right_tile_x}, top_tile_y: ${top_tile_y}, bottom_tile_y: ${bottom_tile_y}`);
 
             // Calculate the start and end x and y values for the tiles
             // Example: 2560 width, 32 TILE_SIZE, player at 1000, 1000. Scale is already applied to g_nr_of_tiles_x/y.
@@ -193,7 +208,6 @@
 
             const startX = (currentWidth / 2) - ((g_player_x - left_tile_x) * TILE_SIZE * scale);   // can be negative
             const startY = (currentHeight / 2) - ((g_player_y - top_tile_y) * TILE_SIZE *scale);   // can be negative
-            console.log(`startX: ${startX}, startY: ${startY}`);
             
             const tiles = [];
             // Loop through the tiles and add them to the array
@@ -218,13 +232,34 @@
         // The redraw function will clear the canvas and draw the tiles that are visible on the screen.
         function redraw(transform) {
             context.clearRect(0, 0, canvas.width, canvas.height);
-            const tiles = computeTiles(transform);
-            tiles.forEach(tile => {
-                // const transformedX = tile.x * transform.k + transform.x;
-                // const transformedY = tile.y * transform.k + transform.y;
-                // drawTile(transformedX, transformedY, tile.size * transform.k);
-                drawTile(tile.terrain, tile.x, tile.y, tile.size);
-            });
+
+            if (!USE_ALLOCATION_FREE_REDRAW) {
+                const tiles = computeTiles(transform);
+                tiles.forEach(tile => {
+                    drawTile(tile.terrain, tile.x, tile.y, tile.size);
+                });
+                return;
+            }
+
+            const scale = transform.k;
+            const currentWidth = canvas.width;
+            const currentHeight = canvas.height;
+            const left_tile_x = g_player_x - Math.floor(g_nr_of_tiles_x / 2) - 1;
+            const right_tile_x = g_player_x + Math.floor(g_nr_of_tiles_x / 2) + 1;
+            const top_tile_y = g_player_y - Math.floor(g_nr_of_tiles_y / 2) - 1;
+            const bottom_tile_y = g_player_y + Math.floor(g_nr_of_tiles_y / 2) + 1;
+            const startX = (currentWidth / 2) - ((g_player_x - left_tile_x) * TILE_SIZE * scale);
+            const startY = (currentHeight / 2) - ((g_player_y - top_tile_y) * TILE_SIZE * scale);
+            const actualTileSize = TILE_SIZE * scale;
+
+            for (let x = left_tile_x; x < right_tile_x; x += 1) {
+                const xpos = startX + ((x - left_tile_x) * actualTileSize);
+                for (let y = top_tile_y; y < bottom_tile_y; y += 1) {
+                    const ypos = startY + ((y - top_tile_y) * actualTileSize);
+                    const terrain = generateTerrain(x, y);
+                    drawTile(terrain, xpos, ypos, actualTileSize);
+                }
+            }
         }
 
 
@@ -263,12 +298,10 @@
         const zoomBehavior = d3.zoom()
             .scaleExtent([1, 8])
             .on("zoom", ({ transform }) => {
-                console.log('transform: ', transform.toString());
                 // Apply the new translation relative to the existing translation
                 const newTransform = d3.zoomIdentity
                     .translate(currentTransform.x, currentTransform.y)
                     .scale(transform.k);
-                console.log('new transform: ', transform.toString());
 
                 currentTransform = newTransform; // Update currentTransform globally
                 calculateNrOfTiles(currentTransform);
