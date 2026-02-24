@@ -41,9 +41,9 @@
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 
         // Tile settings
-        const TILE_SIZE = 32;         // Size of tile in pixels
+        const TILE_SIZE = 8;         // Size of tile in pixels
         const MOVE_AMOUNT = TILE_SIZE; // Nr of pixels to move when a key is pressed
-        const NOISE_ZOOM = 100;       // Zoom level for the noise function. Higher zoom gives less variation in terrain.
+        const NOISE_ZOOM = 10;       // Zoom level for the noise function. Higher zoom gives less variation in terrain.
 
         // Map settings
         const PLAYER_STARTING_POSITION_X = 10000; // Player starting x-coordinate
@@ -55,17 +55,6 @@
 
         let g_player_x = PLAYER_STARTING_POSITION_X;        // Current player x-coordinate.
         let g_player_y = PLAYER_STARTING_POSITION_X;        // Current player y-coordinate
-
-        // Initialize the variables that hold the number of tiles that will fit in the canvas,
-        //  given current TILE_SIZE, canvas width and height and zoom level.
-        // This will have to be changed every time the screen changes in size, something moves, or the zoom level changes.
-        let g_nr_of_tiles_x = 0;
-        let g_nr_of_tiles_y = 0;
-
-        // Noise.js setup
-        // The noise object is a global object that can be used to generate Perlin noise.
-        // The seed is set to a fixed value for consistency.
-        noise.seed(12345);
 
         // Terrain colors for each terrain type
         // Later, you might replace this with bitmaps or more complex textures.
@@ -82,6 +71,11 @@
             snow: "#ffffff"
         };
 
+        // Initialize the variables that hold the number of tiles that will fit in the canvas,
+        //  given current TILE_SIZE, canvas width and height and zoom level.
+        // This will have to be changed every time the screen changes in size, something moves, or the zoom level changes.
+        let g_nr_of_tiles_x = 0;
+        let g_nr_of_tiles_y = 0;
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Functions
@@ -102,7 +96,8 @@
                 }
             }
             // for all other coordinates, calculate the terrain based on the noise value
-            const value = noise.simplex2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use simplex2 for 2D noise
+            // const value = noise.simplex2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use simplex2 for 2D noise
+            const value = noise.perlin2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use perlin2 for 2D noise
             // console.log(`x: ${x}, y: ${y}, value: ${value}`);
             if (value < -0.2) return "water";
             if (value < 0.1) return "beach";
@@ -146,17 +141,22 @@
             // TranslateX and translateY are the translations in x and y directions.
             // The translation is a movement in the direction opposite to the movement of the player,
             //  hence the negative values for translateX and translateY.
+            console.log(`transform: ${transform}`);
 
             // Scale is the zoom level (1-8). This is interpolated on a quadratic curve: 1, 1.13, 2, ..., 4, ..., 8.
             const scale = transform.k; 
-            const translateX = -transform.x / scale;
-            const translateY = -transform.y / scale;
-            // console.log(`translateX: ${translateX}, translateY: ${translateY}, scale: ${scale}`);
+            const translateX = transform.x / scale;
+            const translateY = transform.y / scale;
+            console.log(`translateX: ${translateX}, translateY: ${translateY}, scale: ${scale}`);
 
             // Calculate the new player x- and y-coordinates. If the movement is smaller than a single tile, set movement to 0 for now.
             // later, we may want to allow the player to move a fraction of a tile.
-            g_player_x += Math.floor(translateX / TILE_SIZE);
-            g_player_y += Math.floor(translateY / TILE_SIZE);
+            // the translation will continually update, so the player position is the starting position plus the translation.
+
+            console.log(`before: g_player_x: ${g_player_x}, g_player_y: ${g_player_y}`);
+            g_player_x = PLAYER_STARTING_POSITION_X + Math.floor(translateX / TILE_SIZE);        // Current player x-coordinate.
+            g_player_y = PLAYER_STARTING_POSITION_X + Math.floor(translateY / TILE_SIZE);        // Current player y-coordinate
+            console.log(`after: g_player_x: ${g_player_x}, g_player_y: ${g_player_y}`);
         }
 
 
@@ -174,12 +174,15 @@
             const currentWidth = canvas.width;
             const currentHeight = canvas.height;
 
+            console.log(g_nr_of_tiles_x, g_nr_of_tiles_y, currentWidth, currentHeight); 
+
             // Calculate how many tiles fit on the screen
             // Add an extra tile each way to prevent flickering when moving and in case it is needed for the edge tiles
             const left_tile_x = g_player_x - Math.floor(g_nr_of_tiles_x / 2) - 1;
             const right_tile_x = g_player_x + Math.floor(g_nr_of_tiles_x / 2) + 1;
             const top_tile_y = g_player_y - Math.floor(g_nr_of_tiles_y / 2) - 1;
             const bottom_tile_y = g_player_y + Math.floor(g_nr_of_tiles_y / 2) + 1;            
+            console.log(`left_tile_x: ${left_tile_x}, right_tile_x: ${right_tile_x}, top_tile_y: ${top_tile_y}, bottom_tile_y: ${bottom_tile_y}`);
 
             // Calculate the start and end x and y values for the tiles
             // Example: 2560 width, 32 TILE_SIZE, player at 1000, 1000. Scale is already applied to g_nr_of_tiles_x/y.
@@ -187,10 +190,11 @@
             // 
             // startX = (2560/2 = 1280) - ((1000 - 959) * 32) = 1280 - 41 * 32 = 1280 - 1320 = -32
             // startY = (1600/2 = 800) - ((1000 - 979) * 32) = 800 - 26 * 32 = 800 - 832 = -32
-            const startX = (currentWidth / 2) - ((g_player_x - left_tile_x) * TILE_SIZE);   // can be negative
-            const startY = (currentHeight / 2) - ((g_player_y - top_tile_y) * TILE_SIZE);   // can be negative
 
-
+            const startX = (currentWidth / 2) - ((g_player_x - left_tile_x) * TILE_SIZE * scale);   // can be negative
+            const startY = (currentHeight / 2) - ((g_player_y - top_tile_y) * TILE_SIZE *scale);   // can be negative
+            console.log(`startX: ${startX}, startY: ${startY}`);
+            
             const tiles = [];
             // Loop through the tiles and add them to the array
             // Note that the tiles are drawn at the original x and y, not the transformed x and y
@@ -228,6 +232,11 @@
         // Create canvas 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
 
+        // Noise.js setup
+        // The noise object is a global object that can be used to generate Perlin noise.
+        // The seed is set to a fixed value for consistency.
+        noise.seed(12345);
+
         //
         // Now let's set up the canvas and the zoom behavior
         // and use those functions we created earlier
@@ -254,11 +263,17 @@
         const zoomBehavior = d3.zoom()
             .scaleExtent([1, 8])
             .on("zoom", ({ transform }) => {
-                // console.log('transform: ', transform.toString());
-                currentTransform = transform; // Update currentTransform globally
-                calculateNrOfTiles(transform);
-                calculateNewPlayerPosition(transform);                
-                redraw(transform);
+                console.log('transform: ', transform.toString());
+                // Apply the new translation relative to the existing translation
+                const newTransform = d3.zoomIdentity
+                    .translate(currentTransform.x, currentTransform.y)
+                    .scale(transform.k);
+                console.log('new transform: ', transform.toString());
+
+                currentTransform = newTransform; // Update currentTransform globally
+                calculateNrOfTiles(currentTransform);
+                calculateNewPlayerPosition(currentTransform);
+                redraw(currentTransform);
             });
         // Apply the zoom behavior to the canvas
         d3.select(canvas).call(zoomBehavior);
@@ -306,25 +321,27 @@
         function handleMovement() {
             let moved = false;
 
+            // Fixed: movement should be one tile per keypress independent of zoom scale.
+
+
             if (keys["w"]) {
-                currentTransform = currentTransform.translate(0, -MOVE_AMOUNT / currentTransform.k);
+                currentTransform = currentTransform.translate(0, -MOVE_AMOUNT);
                 moved = true;
             }
             if (keys["a"]) {
-                currentTransform = currentTransform.translate(-MOVE_AMOUNT / currentTransform.k, 0);
+                currentTransform = currentTransform.translate(-MOVE_AMOUNT, 0);
                 moved = true;
             }
             if (keys["s"]) {
-                currentTransform = currentTransform.translate(0, MOVE_AMOUNT / currentTransform.k);
+                currentTransform = currentTransform.translate(0, MOVE_AMOUNT);
                 moved = true;
             }
             if (keys["d"]) {
-                currentTransform = currentTransform.translate(MOVE_AMOUNT / currentTransform.k, 0);
+                currentTransform = currentTransform.translate(MOVE_AMOUNT, 0);
                 moved = true;
             }
 
             if (moved) {
-                d3.select(canvas).call(zoomBehavior.transform, currentTransform);
                 calculateNrOfTiles(currentTransform);
                 calculateNewPlayerPosition(currentTransform);
                 redraw(currentTransform);
