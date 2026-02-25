@@ -56,9 +56,6 @@
         const MAP_X_MAX = PLAYER_STARTING_POSITION_X * 2; // Bottom x-coordinate of the map
         const MAP_Y_MAX  = PLAYER_STARTING_POSITION_Y * 2; // Bottom y-coordinate of the map
 
-        let g_player_x = PLAYER_STARTING_POSITION_X;        // Current player x-coordinate.
-        let g_player_y = PLAYER_STARTING_POSITION_X;        // Current player y-coordinate
-
         // Terrain colors for each terrain type
         // Later, you might replace this with bitmaps or more complex textures.
         const TERRAIN_COLORS = {
@@ -74,11 +71,6 @@
             snow: "#ffffff"
         };
 
-        // Initialize the variables that hold the number of tiles that will fit in the canvas,
-        //  given current TILE_SIZE, canvas width and height and zoom level.
-        // This will have to be changed every time the screen changes in size, something moves, or the zoom level changes.
-        let g_nr_of_tiles_x = 0;
-        let g_nr_of_tiles_y = 0;
         const terrainCache = new Map();
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
@@ -148,82 +140,23 @@
             context.fillRect(x, y, size, size);
         }
 
-        // Calculate the maximum nr of tiles in x- en y-directions that will be visible for the current zoom level and canvas size.
-        // This will be used in the redraw function to determine which tiles to draw.
-        // Note that the number of tiles will be rounded down to the nearest integer, so you will need to take partial tiles into account
-        //  when drawing the tiles.
-        function calculateNrOfTiles(transform) {
-            const scale = transform.k;
-            g_nr_of_tiles_x = Math.floor(canvas.width / TILE_SIZE / scale);
-            g_nr_of_tiles_y = Math.floor(canvas.height / TILE_SIZE / scale);
-        }
-        
-        function calculateNewPlayerPosition(transform) {
-            // Calculate the new player position based on the current player position and the transform.
-            // The player position is the center of the screen, so the player position is the negative of the translation.
-            // TranslateX and translateY are the translations in x and y directions.
-            // The translation is a movement in the direction opposite to the movement of the player,
-            //  hence the negative values for translateX and translateY.
-            // Scale is the zoom level (1-8). This is interpolated on a quadratic curve: 1, 1.13, 2, ..., 4, ..., 8.
-            const scale = transform.k; 
-            const translateX = transform.x / scale;
-            const translateY = transform.y / scale;
-
-            // Calculate the new player x- and y-coordinates. If the movement is smaller than a single tile, set movement to 0 for now.
-            // later, we may want to allow the player to move a fraction of a tile.
-            // the translation will continually update, so the player position is the starting position plus the translation.
-
-            g_player_x = PLAYER_STARTING_POSITION_X + Math.floor(translateX / TILE_SIZE);        // Current player x-coordinate.
-            g_player_y = PLAYER_STARTING_POSITION_X + Math.floor(translateY / TILE_SIZE);        // Current player y-coordinate
-        }
-
-
-        // This function calculates the tiles that are visible on the screen, based on the current zoom level and player position.
-        // It returns an array of tiles that should be drawn on the screen.
-        // The preconditions are:
-        //      - the canvas width and height are set correctly (even after a resize)
-        //      - the current position of the player has been set in g_player_x and g_player_y
-        //      - the width of the canvas in tiles has been set in g_nr_of_tiles_x and g_nr_of_tiles_y
-        //      - the current zoom level has been set in currentTransform.k
+        // Compute visible world tile range directly from transform (no player-position projection).
         function computeTiles(transform) {
-            // Scale is the zoom level (1-8). This is interpolated on a quadratic curve: 1, 1.13, 2, ..., 4, ..., 8.
-            const scale = transform.k; 
+            const k = transform.k;
+            const tilePx = TILE_SIZE * k;
+            const x0 = Math.floor((0 - transform.x) / tilePx) - 1;
+            const x1 = Math.floor((canvas.width - transform.x) / tilePx) + 2;
+            const y0 = Math.floor((0 - transform.y) / tilePx) - 1;
+            const y1 = Math.floor((canvas.height - transform.y) / tilePx) + 2;
 
-            const currentWidth = canvas.width;
-            const currentHeight = canvas.height;
-
-            // Calculate how many tiles fit on the screen
-            // Add an extra tile each way to prevent flickering when moving and in case it is needed for the edge tiles
-            const left_tile_x = g_player_x - Math.floor(g_nr_of_tiles_x / 2) - 1;
-            const right_tile_x = g_player_x + Math.floor(g_nr_of_tiles_x / 2) + 1;
-            const top_tile_y = g_player_y - Math.floor(g_nr_of_tiles_y / 2) - 1;
-            const bottom_tile_y = g_player_y + Math.floor(g_nr_of_tiles_y / 2) + 1;            
-
-            // Calculate the start and end x and y values for the tiles
-            // Example: 2560 width, 32 TILE_SIZE, player at 1000, 1000. Scale is already applied to g_nr_of_tiles_x/y.
-            // The screen is 80 tiles wide (2560/32 at scale 1), so the left tile is at 1000 - 40 = 960, the right tile is at 1000 + 40 = 1040
-            // 
-            // startX = (2560/2 = 1280) - ((1000 - 959) * 32) = 1280 - 41 * 32 = 1280 - 1320 = -32
-            // startY = (1600/2 = 800) - ((1000 - 979) * 32) = 800 - 26 * 32 = 800 - 832 = -32
-
-            const startX = (currentWidth / 2) - ((g_player_x - left_tile_x) * TILE_SIZE * scale);   // can be negative
-            const startY = (currentHeight / 2) - ((g_player_y - top_tile_y) * TILE_SIZE *scale);   // can be negative
-            
             const tiles = [];
-            // Loop through the tiles and add them to the array
-            // Note that the tiles are drawn at the original x and y, not the transformed x and y
-            // Also note that the TILE_SIZE is multiplied by the scale, so the tiles get larger when zooming in
-            // We let drawTile take care of the issue of partial tiles.
-            let actualTileSize = TILE_SIZE * scale;
-            for (let x = left_tile_x; x < right_tile_x; x += 1) {
-                let xpos = startX + ((x - left_tile_x) * actualTileSize);
-                for (let y = top_tile_y; y < bottom_tile_y; y += 1) {
-                    let ypos = startY + ((y - top_tile_y) * actualTileSize);
+            for (let x = x0; x < x1; x += 1) {
+                const xpos = x * tilePx + transform.x;
+                for (let y = y0; y < y1; y += 1) {
+                    const ypos = y * tilePx + transform.y;
                     const terrain = generateTerrain(x, y);
-                    tiles.push({ terrain: terrain, x: xpos, y: ypos, size: actualTileSize });
-                    ypos += actualTileSize;
+                    tiles.push({ terrain: terrain, x: xpos, y: ypos, size: tilePx });
                 }
-                xpos += actualTileSize;
             }
             return tiles;
         }
@@ -241,23 +174,19 @@
                 return;
             }
 
-            const scale = transform.k;
-            const currentWidth = canvas.width;
-            const currentHeight = canvas.height;
-            const left_tile_x = g_player_x - Math.floor(g_nr_of_tiles_x / 2) - 1;
-            const right_tile_x = g_player_x + Math.floor(g_nr_of_tiles_x / 2) + 1;
-            const top_tile_y = g_player_y - Math.floor(g_nr_of_tiles_y / 2) - 1;
-            const bottom_tile_y = g_player_y + Math.floor(g_nr_of_tiles_y / 2) + 1;
-            const startX = (currentWidth / 2) - ((g_player_x - left_tile_x) * TILE_SIZE * scale);
-            const startY = (currentHeight / 2) - ((g_player_y - top_tile_y) * TILE_SIZE * scale);
-            const actualTileSize = TILE_SIZE * scale;
+            const k = transform.k;
+            const tilePx = TILE_SIZE * k;
+            const x0 = Math.floor((0 - transform.x) / tilePx) - 1;
+            const x1 = Math.floor((canvas.width - transform.x) / tilePx) + 2;
+            const y0 = Math.floor((0 - transform.y) / tilePx) - 1;
+            const y1 = Math.floor((canvas.height - transform.y) / tilePx) + 2;
 
-            for (let x = left_tile_x; x < right_tile_x; x += 1) {
-                const xpos = startX + ((x - left_tile_x) * actualTileSize);
-                for (let y = top_tile_y; y < bottom_tile_y; y += 1) {
-                    const ypos = startY + ((y - top_tile_y) * actualTileSize);
+            for (let x = x0; x < x1; x += 1) {
+                const xpos = x * tilePx + transform.x;
+                for (let y = y0; y < y1; y += 1) {
+                    const ypos = y * tilePx + transform.y;
                     const terrain = generateTerrain(x, y);
-                    drawTile(terrain, xpos, ypos, actualTileSize);
+                    drawTile(terrain, xpos, ypos, tilePx);
                 }
             }
         }
@@ -292,24 +221,23 @@
         // Add the behaviour to apply zooming to the canvas
         // The zoom behavior is defined using d3.zoom() and applied to the canvas element.
 
-        // Set the initial zoom level
-        let currentTransform = d3.zoomIdentity;
+        // Set the initial camera transform (start tile centered on screen)
+        let currentTransform = d3.zoomIdentity.translate(
+            (canvas.width / 2) - (PLAYER_STARTING_POSITION_X * TILE_SIZE),
+            (canvas.height / 2) - (PLAYER_STARTING_POSITION_Y * TILE_SIZE)
+        );
 
+        // Keep zoom behavior simple like d3-fantasychart3:
+        // let D3 manage wheel zoom focus natively (world point under cursor stays fixed).
         const zoomBehavior = d3.zoom()
             .scaleExtent([1, 8])
-            .on("zoom", ({ transform }) => {
-                // Apply the new translation relative to the existing translation
-                const newTransform = d3.zoomIdentity
-                    .translate(currentTransform.x, currentTransform.y)
-                    .scale(transform.k);
-
-                currentTransform = newTransform; // Update currentTransform globally
-                calculateNrOfTiles(currentTransform);
-                calculateNewPlayerPosition(currentTransform);
+            .on("zoom", (event) => {
+                currentTransform = event.transform;
                 redraw(currentTransform);
             });
-        // Apply the zoom behavior to the canvas
-        d3.select(canvas).call(zoomBehavior);
+
+        // Apply the behavior and synchronize the initial transform state.
+        d3.select(canvas).call(zoomBehavior).call(zoomBehavior.transform, currentTransform);
 
         // Add a resize listener. This will redraw the tiles when the window is resized.
         // It also debounces the resize event, so it doesn't redraw the tiles too often, using a timer with a short timeout.
@@ -332,8 +260,6 @@
                 // Reapply the old currentTransform after resizing
                 // This prevents the map from jumping around when resizing
                 d3.select(canvas).call(zoomBehavior.transform, currentTransform);
-                calculateNrOfTiles(currentTransform);
-                calculateNewPlayerPosition(currentTransform);
                 redraw(currentTransform);
             }, 100); // Stel de debounce-tijd in (bijvoorbeeld 100 ms)
         });
@@ -358,26 +284,24 @@
 
 
             if (keys["w"]) {
-                currentTransform = currentTransform.translate(0, -MOVE_AMOUNT);
-                moved = true;
-            }
-            if (keys["a"]) {
-                currentTransform = currentTransform.translate(-MOVE_AMOUNT, 0);
-                moved = true;
-            }
-            if (keys["s"]) {
                 currentTransform = currentTransform.translate(0, MOVE_AMOUNT);
                 moved = true;
             }
-            if (keys["d"]) {
+            if (keys["a"]) {
                 currentTransform = currentTransform.translate(MOVE_AMOUNT, 0);
+                moved = true;
+            }
+            if (keys["s"]) {
+                currentTransform = currentTransform.translate(0, -MOVE_AMOUNT);
+                moved = true;
+            }
+            if (keys["d"]) {
+                currentTransform = currentTransform.translate(-MOVE_AMOUNT, 0);
                 moved = true;
             }
 
             if (moved) {
-                calculateNrOfTiles(currentTransform);
-                calculateNewPlayerPosition(currentTransform);
-                redraw(currentTransform);
+                d3.select(canvas).call(zoomBehavior.transform, currentTransform);
             }
         }
 
@@ -390,8 +314,6 @@
         canvas.focus();
 
         // Draw the initial screen
-        calculateNrOfTiles(currentTransform);
-        calculateNewPlayerPosition(currentTransform);
         redraw(currentTransform);
     </script>
 </body>
