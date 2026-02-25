@@ -12,6 +12,17 @@
             overflow: hidden;
             background-color: #f0f8ff; /* Subtiele lichtblauwe achtergrond */ 
         }
+        .tooltip {
+            position: absolute;
+            text-align: center;
+            padding: 8px;
+            background: rgba(0, 0, 0, 0.55);
+            color: #ffffff;
+            border-radius: 4px;
+            pointer-events: none;
+            font-size: 12px;
+            opacity: 0;
+        }
     </style>
 </head>
 <body>
@@ -80,34 +91,41 @@
         // Function for terrain generation
         // This function generates a terrain type based on the noise value at a given (x, y) coordinate.
         // Please read https://www.redblobgames.com/maps/terrain-from-noise/ for ideas on what I am trying to do here.
+        function getTerrainInfo(x, y) {
+            const isOutsideMap = (x < MAP_X_MIN || x > MAP_X_MAX || y < MAP_Y_MIN || y > MAP_Y_MAX);
+            const isEdgeTile = (x === MAP_X_MIN || x === MAP_X_MAX || y === MAP_Y_MIN || y === MAP_Y_MAX);
+
+            if (isOutsideMap) {
+                return { terrain: "ocean", noiseValue: null, zone: "outside" };
+            }
+            if (isEdgeTile) {
+                return { terrain: "beach", noiseValue: null, zone: "edge" };
+            }
+
+            const noiseValue = noise.perlin2(x / NOISE_ZOOM, y / NOISE_ZOOM);
+            let terrain;
+
+            // Single-noise elevation bands that use all terrain color categories.
+            if (noiseValue < -0.38) terrain = "water";
+            else if (noiseValue < -0.26) terrain = "beach";
+            else if (noiseValue < -0.06) terrain = "plains";
+            else if (noiseValue < 0.14) terrain = "grassland";
+            else if (noiseValue < 0.32) terrain = "forest";
+            else if (noiseValue < 0.50) terrain = "forest2";
+            else if (noiseValue < 0.68) terrain = "mountain";
+            else if (noiseValue < 0.84) terrain = "mountain2";
+            else terrain = "snow";
+
+            return { terrain: terrain, noiseValue: noiseValue, zone: "inland" };
+        }
+
         function generateTerrain(x, y) {
             const cacheKey = `${x},${y}`;
             if (USE_TERRAIN_CACHE && terrainCache.has(cacheKey)) {
                 return terrainCache.get(cacheKey);
             }
 
-            let terrain;
-            // first check if the (x,y) terrain is at the edge of the map. This should be beach.
-            if (x <= MAP_X_MIN || x >= MAP_X_MAX || y <= MAP_Y_MIN || y >= MAP_Y_MAX) {
-                if (x == MAP_X_MIN || x == MAP_X_MAX || y == MAP_Y_MIN || y == MAP_Y_MAX) {
-                    // Terrain at the edge of the map is beach
-                    terrain = "beach";
-                } else {    
-                    // Terrain outside the map is water
-                    terrain = "ocean";
-                }
-            } else {
-                // for all other coordinates, calculate the terrain based on the noise value
-                // const value = noise.simplex2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use simplex2 for 2D noise
-                const value = noise.perlin2(x / NOISE_ZOOM, y / NOISE_ZOOM); // Use perlin2 for 2D noise
-                if (value < -0.2) terrain = "water";
-                else if (value < 0.1) terrain = "beach";
-                else if (value < 0.3) terrain = "grassland";
-                else if (value < 0.5) terrain = "forest";
-                else if (value < 0.8) terrain = "mountain";
-                else terrain = "snow";
-            }
-
+            const terrain = getTerrainInfo(x, y).terrain;
             if (USE_TERRAIN_CACHE) {
                 terrainCache.set(cacheKey, terrain);
             }
@@ -213,6 +231,9 @@
         canvas.height = window.innerHeight;
         document.body.appendChild(canvas);
         const context = canvas.getContext("2d");
+        const tooltip = d3.select("body")
+            .append("div")
+            .attr("class", "tooltip");
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Create the event listeners for resize, zoom, and keydown/keyup on the canvas and the window
@@ -275,6 +296,35 @@
 
         window.addEventListener("keyup", (event) => {
             keys[event.key] = false;
+        });
+
+        canvas.addEventListener("mousemove", (event) => {
+            const rect = canvas.getBoundingClientRect();
+            const mouseX = event.clientX - rect.left;
+            const mouseY = event.clientY - rect.top;
+            const tilePx = TILE_SIZE * currentTransform.k;
+            const tileX = Math.floor((mouseX - currentTransform.x) / tilePx);
+            const tileY = Math.floor((mouseY - currentTransform.y) / tilePx);
+            const info = getTerrainInfo(tileX, tileY);
+            const color = TERRAIN_COLORS[info.terrain] || "n/a";
+            const noiseText = (info.noiseValue === null) ? "n/a" : info.noiseValue.toFixed(3);
+
+            tooltip
+                .style("opacity", 1)
+                .html(
+                    `Terrain: ${info.terrain}<br>` +
+                    `Color: ${color}<br>` +
+                    `x: ${tileX}, y: ${tileY}<br>` +
+                    `Zone: ${info.zone}<br>` +
+                    `Noise: ${noiseText}<br>` +
+                    `Zoom: ${currentTransform.k.toFixed(2)}`
+                )
+                .style("left", `${event.pageX + 10}px`)
+                .style("top", `${event.pageY - 10}px`);
+        });
+
+        canvas.addEventListener("mouseleave", () => {
+            tooltip.style("opacity", 0);
         });
 
         function handleMovement() {
