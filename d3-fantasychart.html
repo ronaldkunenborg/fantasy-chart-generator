@@ -46,6 +46,22 @@
         .control-panel input[type="range"] {
             width: 180px;
         }
+        .logo-panel {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 11;
+            width: 180px;
+            padding: 0;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+        }
+        .logo-panel img {
+            display: block;
+            width: 100%;
+            height: auto;
+        }
     </style>
 </head>
 <body>
@@ -139,6 +155,10 @@
             mountainBaseEdge: 0.62,
             mountainBaseCore: 0.82,
             mountainBlendStrength: 0.88,
+            waterRegionProfilePower: 1.6,
+            waterBaseEdge: 0.40,
+            waterBaseCore: 0.26,
+            waterBlendStrength: 0.32,
             lowlandSinkStrength: 0.16
         };
 
@@ -304,6 +324,23 @@
             const mountainStrength = 0.2 + (mountainMultiplier * 1.6); // 0..100% maps to 0.2..1.8, 50% ~= baseline
             const mountainBlend = clamp01(mountainRegion * TERRAIN_MODEL.mountainBlendStrength * mountainStrength);
             elevation = clamp01((elevation * (1 - mountainBlend)) + (mountainBaseline * mountainBlend));
+
+            // Use inverse mountainness to carve coherent lowland/water basins.
+            const waterThreshold0 = clamp01(1 - mountainThreshold1);
+            const waterThreshold1 = clamp01(1 - mountainThreshold0);
+            const waterRegion = smoothstep(
+                waterThreshold0,
+                waterThreshold1,
+                1 - mountainness
+            );
+            const waterProfile = Math.pow(waterRegion, TERRAIN_MODEL.waterRegionProfilePower);
+            const waterBaseline =
+                TERRAIN_MODEL.waterBaseEdge +
+                (TERRAIN_MODEL.waterBaseCore - TERRAIN_MODEL.waterBaseEdge) * waterProfile;
+            const waterLowlandGate = 1 - smoothstep(0.38, 0.60, elevation); // only carve strongly in lower terrain
+            const waterBlend = clamp01(waterRegion * TERRAIN_MODEL.waterBlendStrength * waterLowlandGate);
+            elevation = clamp01((elevation * (1 - waterBlend)) + (waterBaseline * waterBlend));
+
             elevation = clamp01(elevation - (lowlandDepth * TERRAIN_MODEL.lowlandSinkStrength * (1 - mountainRegion)));
 
             // [Change 6] Temperature proxy: latitude + elevation cooling.
@@ -546,9 +583,22 @@
         const tooltip = d3.select("body")
             .append("div")
             .attr("class", "tooltip");
+        const logoPanel = d3.select("body")
+            .append("div")
+            .attr("class", "logo-panel");
+        const logoImage = logoPanel.append("img")
+            .attr("src", "fantasymapgeneratorlogo.png")
+            .attr("alt", "Fantasy Map Generator logo");
         const controls = d3.select("body")
             .append("div")
             .attr("class", "control-panel");
+        function positionControlsBelowLogo() {
+            const logoRect = logoPanel.node().getBoundingClientRect();
+            controls.style("top", `${Math.round(logoRect.bottom + 12)}px`);
+        }
+        logoImage.on("load", positionControlsBelowLogo);
+        window.addEventListener("resize", positionControlsBelowLogo);
+        positionControlsBelowLogo();
         const moistureLabel = controls.append("label")
             .attr("for", "moisture-slider")
             .text("Moisture: 50%");
@@ -719,3 +769,4 @@
     </script>
 </body>
 </html>
+
