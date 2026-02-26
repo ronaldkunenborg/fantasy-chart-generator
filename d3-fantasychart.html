@@ -82,6 +82,26 @@
             snow: "#ffffff"
         };
 
+        // Terrain model tuning
+        const TERRAIN_MODEL = {
+            // deterministic offsets to derive independent noise fields from one seeded generator
+            elevationOffsetX: 1013,
+            elevationOffsetY: -809,
+            moistureOffsetX: -4777,
+            moistureOffsetY: 2089,
+            ridgeOffsetX: 3307,
+            ridgeOffsetY: -7123,
+
+            // fBm settings
+            octaves: 5,
+            lacunarity: 2.0,
+            gain: 0.5,
+
+            // redistribution shaping
+            elevationExponent: 1.30,
+            moistureExponent: 1.05
+        };
+
         const terrainCache = new Map();
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
@@ -91,33 +111,171 @@
         // Function for terrain generation
         // This function generates a terrain type based on the noise value at a given (x, y) coordinate.
         // Please read https://www.redblobgames.com/maps/terrain-from-noise/ for ideas on what I am trying to do here.
+        function clamp01(v) {
+            return Math.max(0, Math.min(1, v));
+        }
+
+        function normalizeNoise(v) {
+            // perlin2 outputs roughly [-1..1]; normalize to [0..1]
+            return clamp01((v + 1) * 0.5);
+        }
+
+        function smoothstep(edge0, edge1, x) {
+            const t = clamp01((x - edge0) / (edge1 - edge0));
+            return t * t * (3 - 2 * t);
+        }
+
+        function fbmNoise2(x, y, zoom, offsetX, offsetY) {
+            let amplitude = 1.0;
+            let frequency = 1.0;
+            let sum = 0.0;
+            let amplitudeSum = 0.0;
+
+            for (let i = 0; i < TERRAIN_MODEL.octaves; i += 1) {
+                const nx = ((x + offsetX) / zoom) * frequency;
+                const ny = ((y + offsetY) / zoom) * frequency;
+                sum += noise.perlin2(nx, ny) * amplitude;
+                amplitudeSum += amplitude;
+                frequency *= TERRAIN_MODEL.lacunarity;
+                amplitude *= TERRAIN_MODEL.gain;
+            }
+            return sum / amplitudeSum;
+        }
+
+        function ridgedNoise2(x, y, zoom, offsetX, offsetY) {
+            // Ridged variant often used for mountain-like structures.
+            // Inspired by Red Blob's recommendation to combine noise variants for landform detail.
+            const n = fbmNoise2(x, y, zoom, offsetX, offsetY);
+            return 1.0 - Math.abs(n); // [0..1] with sharp ridges near 1
+        }
+
+        function pickBiome(temperature, moisture) {
+            // [Change 2] Red Blob: biomes from elevation+moisture (plus temp proxy here).
+            if (temperature < 0.20) return (moisture < 0.45 ? "tundra" : "snow");
+            if (temperature < 0.35) return (moisture < 0.35 ? "tundra" : "taiga");
+            if (temperature < 0.55) {
+                if (moisture < 0.25) return "shrubland";
+                if (moisture < 0.55) return "grassland";
+                return "temperate_forest";
+            }
+            if (moisture < 0.18) return "desert";
+            if (moisture < 0.42) return "plains";
+            if (moisture < 0.72) return "forest";
+            return "rainforest";
+        }
+
+        function biomeToTerrain(biome) {
+            // [Change 5] Separate biome decision from final terrain rendering category.
+            switch (biome) {
+                case "desert":
+                    return "beach";
+                case "plains":
+                    return "plains";
+                case "grassland":
+                    return "grassland";
+                case "shrubland":
+                    return "plains";
+                case "temperate_forest":
+                    return "forest";
+                case "rainforest":
+                    return "forest2";
+                case "taiga":
+                    return "forest2";
+                case "tundra":
+                    return "mountain2";
+                case "snow":
+                    return "snow";
+                default:
+                    return "grassland";
+            }
+        }
+
         function getTerrainInfo(x, y) {
             const isOutsideMap = (x < MAP_X_MIN || x > MAP_X_MAX || y < MAP_Y_MIN || y > MAP_Y_MAX);
             const isEdgeTile = (x === MAP_X_MIN || x === MAP_X_MAX || y === MAP_Y_MIN || y === MAP_Y_MAX);
 
             if (isOutsideMap) {
-                return { terrain: "ocean", noiseValue: null, zone: "outside" };
+                return {
+                    terrain: "ocean",
+                    biome: "ocean",
+                    elevation: 0,
+                    moisture: 0,
+                    temperature: 0,
+                    ridge: 0,
+                    zone: "outside"
+                };
             }
             if (isEdgeTile) {
-                return { terrain: "beach", noiseValue: null, zone: "edge" };
+                return {
+                    terrain: "beach",
+                    biome: "coast",
+                    elevation: 0.45,
+                    moisture: 0.5,
+                    temperature: 0.5,
+                    ridge: 0,
+                    zone: "edge"
+                };
             }
 
-            const noiseValue = noise.perlin2(x / NOISE_ZOOM, y / NOISE_ZOOM);
-            let terrain;
+            // [Change 1] Red Blob: use multiple noise fields, not only elevation.
+            let elevation = normalizeNoise(
+                fbmNoise2(x, y, NOISE_ZOOM, TERRAIN_MODEL.elevationOffsetX, TERRAIN_MODEL.elevationOffsetY)
+            );
+            let moisture = normalizeNoise(
+                fbmNoise2(x, y, NOISE_ZOOM * 1.4, TERRAIN_MODEL.moistureOffsetX, TERRAIN_MODEL.moistureOffsetY)
+            );
 
-            // Single-noise elevation bands that use all terrain color categories.
-            if (noiseValue < -0.38) terrain = "water";
-            else if (noiseValue < -0.26) terrain = "beach";
-            else if (noiseValue < -0.06) terrain = "plains";
-            else if (noiseValue < 0.14) terrain = "grassland";
-            else if (noiseValue < 0.32) terrain = "forest";
-            else if (noiseValue < 0.50) terrain = "forest2";
-            else if (noiseValue < 0.68) terrain = "mountain";
-            else if (noiseValue < 0.84) terrain = "mountain2";
-            else terrain = "snow";
+            // [Change 3] Red Blob: octave/fractal composition is implemented in fbmNoise2().
 
-            return { terrain: terrain, noiseValue: noiseValue, zone: "inland" };
+            // [Change 4] Red Blob: redistribute noise to control land/water and biome proportions.
+            elevation = Math.pow(elevation, TERRAIN_MODEL.elevationExponent);
+            moisture = Math.pow(moisture, TERRAIN_MODEL.moistureExponent);
+
+            // [Change 6] Temperature proxy: latitude + elevation cooling.
+            const lat01 = (y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN); // 0 north .. 1 south
+            const equatorDistance = Math.abs(lat01 - 0.5) * 2; // 0 equator .. 1 poles
+            const baseTemperature = 1 - (equatorDistance * 0.85);
+            const temperature = clamp01(baseTemperature - (elevation * 0.45));
+
+            // [Change 7] Coast and mountain refinement with separate ridge signal.
+            const ridge = ridgedNoise2(x, y, NOISE_ZOOM * 0.9, TERRAIN_MODEL.ridgeOffsetX, TERRAIN_MODEL.ridgeOffsetY);
+            const mountainBoost = smoothstep(0.58, 0.88, elevation) * smoothstep(0.55, 0.82, ridge);
+            const elevated = clamp01(elevation + mountainBoost * 0.25);
+
+            // Water/coast bands first
+            if (elevated < 0.30) {
+                return { terrain: "ocean", biome: "ocean", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
+            }
+            if (elevated < 0.36) {
+                return { terrain: "water", biome: "shallow_water", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
+            }
+            if (elevated < 0.41) {
+                return { terrain: "beach", biome: "coast", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
+            }
+
+            // [Change 2] Biome selection from moisture + temperature.
+            const biome = pickBiome(temperature, moisture);
+            let terrain = biomeToTerrain(biome);
+
+            // High elevation override to mountain/snow families.
+            if (elevated > 0.82) terrain = "snow";
+            else if (elevated > 0.74) terrain = ridge > 0.65 ? "mountain2" : "mountain";
+            else if (elevated > 0.64) terrain = ridge > 0.70 ? "mountain" : terrain;
+
+            return {
+                terrain: terrain,
+                biome: biome,
+                elevation: elevated,
+                moisture: moisture,
+                temperature: temperature,
+                ridge: ridge,
+                zone: "inland"
+            };
         }
+
+        // [Change 8] Determinism note:
+        // We keep one global noise seed and derive independent fields through fixed coordinate offsets.
+        // This keeps map generation stable/reproducible while allowing multiple pseudo-independent signals.
 
         function generateTerrain(x, y) {
             const cacheKey = `${x},${y}`;
@@ -307,16 +465,19 @@
             const tileY = Math.floor((mouseY - currentTransform.y) / tilePx);
             const info = getTerrainInfo(tileX, tileY);
             const color = TERRAIN_COLORS[info.terrain] || "n/a";
-            const noiseText = (info.noiseValue === null) ? "n/a" : info.noiseValue.toFixed(3);
 
             tooltip
                 .style("opacity", 1)
                 .html(
                     `Terrain: ${info.terrain}<br>` +
+                    `Biome: ${info.biome}<br>` +
                     `Color: ${color}<br>` +
                     `x: ${tileX}, y: ${tileY}<br>` +
                     `Zone: ${info.zone}<br>` +
-                    `Noise: ${noiseText}<br>` +
+                    `Elevation: ${info.elevation.toFixed(3)}<br>` +
+                    `Moisture: ${info.moisture.toFixed(3)}<br>` +
+                    `Temp: ${info.temperature.toFixed(3)}<br>` +
+                    `Ridge: ${info.ridge.toFixed(3)}<br>` +
                     `Zoom: ${currentTransform.k.toFixed(2)}`
                 )
                 .style("left", `${event.pageX + 10}px`)
