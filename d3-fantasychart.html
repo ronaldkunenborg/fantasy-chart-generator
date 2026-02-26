@@ -84,6 +84,7 @@
         const USE_BIOME_LOOKUP_COLORS = true; // Use Red Blob biome lookup texture for tile colors
         const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_DISCRETE_IMAGE_DATA_URL || "biome-lookup-discrete.png";
         let moistureMultiplier = 0.5; // Global moisture tuning from UI slider
+        let mountainMultiplier = 0.5; // Global mountain tuning from UI slider (coverage + intensity)
 
         // Map settings
         const PLAYER_STARTING_POSITION_X = 10000; // Player starting x-coordinate
@@ -97,16 +98,16 @@
         // Palette sampled from Red Blob's biome lookup smooth gradient:
         // https://www.redblobgames.com/maps/terrain-from-noise/images/biome-lookup-smooth.png
         const TERRAIN_COLORS = {
-            ocean: "#28366b",
-            water: "#4c65ca",
-            beach: "#b0ad83",
-            grassland: "#8a9f78",
-            plains: "#9ca77f",
-            forest: "#77956b",
+            ocean: "#37498b",
+            water: "#6b81da",
+            beach: "#cfcb89",
+            grassland: "#5fa323",
+            plains: "#a7c576",
+            forest: "#356b47",
             forest2: "#698f65",
             mountain: "#afb999",
-            mountain2: "#babd9d",
-            snow: "#dbd9c6"
+            mountain2: "#d0d1c4",
+            snow: "#ffffff"
         };
 
         // Terrain model tuning
@@ -118,6 +119,8 @@
             moistureOffsetY: 2089,
             ridgeOffsetX: 3307,
             ridgeOffsetY: -7123,
+            mountainnessOffsetX: 9017,
+            mountainnessOffsetY: -4561,
 
             // fBm settings
             octaves: 5,
@@ -126,7 +129,17 @@
 
             // redistribution shaping
             elevationExponent: 1.10,
-            moistureExponent: 1.05
+            moistureExponent: 1.05,
+
+            // regional terrain shaping
+            mountainRegionZoom: 42,
+            mountainRegionThreshold0: 0.52,
+            mountainRegionThreshold1: 0.78,
+            mountainRegionProfilePower: 1.8,
+            mountainBaseEdge: 0.62,
+            mountainBaseCore: 0.82,
+            mountainBlendStrength: 0.88,
+            lowlandSinkStrength: 0.16
         };
 
         const terrainCache = new Map();
@@ -261,6 +274,37 @@
             elevation = Math.pow(elevation, TERRAIN_MODEL.elevationExponent);
             moisture = Math.pow(moisture, TERRAIN_MODEL.moistureExponent);
             moisture = clamp01(moisture * moistureMultiplier);
+
+            // Create large-scale mountainous regions and deepen lowlands elsewhere.
+            const mountainness = normalizeNoise(
+                fbmNoise2(
+                    x,
+                    y,
+                    NOISE_ZOOM * TERRAIN_MODEL.mountainRegionZoom,
+                    TERRAIN_MODEL.mountainnessOffsetX,
+                    TERRAIN_MODEL.mountainnessOffsetY
+                )
+            );
+            const mountainThreshold0 = clamp01(
+                TERRAIN_MODEL.mountainRegionThreshold0 + ((0.5 - mountainMultiplier) * 0.24)
+            );
+            const mountainThreshold1 = clamp01(
+                TERRAIN_MODEL.mountainRegionThreshold1 + ((0.5 - mountainMultiplier) * 0.28)
+            );
+            const mountainRegion = smoothstep(
+                mountainThreshold0,
+                mountainThreshold1,
+                mountainness
+            );
+            const mountainProfile = Math.pow(mountainRegion, TERRAIN_MODEL.mountainRegionProfilePower);
+            const lowlandDepth = 1 - smoothstep(0.22, 0.45, elevation); // strongest sink on already-low terrain
+            const mountainBaseline =
+                TERRAIN_MODEL.mountainBaseEdge +
+                (TERRAIN_MODEL.mountainBaseCore - TERRAIN_MODEL.mountainBaseEdge) * mountainProfile;
+            const mountainStrength = 0.2 + (mountainMultiplier * 1.6); // 0..100% maps to 0.2..1.8, 50% ~= baseline
+            const mountainBlend = clamp01(mountainRegion * TERRAIN_MODEL.mountainBlendStrength * mountainStrength);
+            elevation = clamp01((elevation * (1 - mountainBlend)) + (mountainBaseline * mountainBlend));
+            elevation = clamp01(elevation - (lowlandDepth * TERRAIN_MODEL.lowlandSinkStrength * (1 - mountainRegion)));
 
             // [Change 6] Temperature proxy: latitude + elevation cooling.
             const lat01 = (y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN); // 0 north .. 1 south
@@ -505,7 +549,7 @@
         const controls = d3.select("body")
             .append("div")
             .attr("class", "control-panel");
-        controls.append("label")
+        const moistureLabel = controls.append("label")
             .attr("for", "moisture-slider")
             .text("Moisture: 50%");
         controls.append("input")
@@ -519,7 +563,24 @@
                 const value = Number(this.value);
                 moistureMultiplier = value / 100;
                 terrainCache.clear();
-                controls.select("label").text(`Moisture: ${value}%`);
+                moistureLabel.text(`Moisture: ${value}%`);
+                redraw(currentTransform);
+            });
+        const mountainLabel = controls.append("label")
+            .attr("for", "mountain-slider")
+            .text("Mountains: 50%");
+        controls.append("input")
+            .attr("id", "mountain-slider")
+            .attr("type", "range")
+            .attr("min", "0")
+            .attr("max", "100")
+            .attr("step", "1")
+            .attr("value", "50")
+            .on("input", function() {
+                const value = Number(this.value);
+                mountainMultiplier = value / 100;
+                terrainCache.clear();
+                mountainLabel.text(`Mountains: ${value}%`);
                 redraw(currentTransform);
             });
         loadBiomeLookupTexture();
