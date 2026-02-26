@@ -6,6 +6,7 @@
     <title>Fantasy Map</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <script src="perlin.js"></script>
+    <script src="biome-lookup-discrete-image-data.js"></script>
     <style>
         body {
             margin: 0;
@@ -25,6 +26,25 @@
             pointer-events: none;
             font-size: 12px;
             opacity: 0;
+        }
+        .control-panel {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 10;
+            padding: 8px 10px;
+            background: rgba(0, 0, 0, 0.55);
+            color: #ffffff;
+            border-radius: 4px;
+            font-size: 12px;
+            font-family: sans-serif;
+        }
+        .control-panel label {
+            display: block;
+            margin-bottom: 4px;
+        }
+        .control-panel input[type="range"] {
+            width: 180px;
         }
     </style>
 </head>
@@ -61,6 +81,9 @@
         const USE_TERRAIN_CACHE = true; // Toggle terrain cache for performance testing
         const USE_RANDOM_WATER_COLOR = false; // Toggle random water/ocean shading
         const USE_ALLOCATION_FREE_REDRAW = true; // Toggle draw path that avoids per-frame tile-object allocation
+        const USE_BIOME_LOOKUP_COLORS = true; // Use Red Blob biome lookup texture for tile colors
+        const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_DISCRETE_IMAGE_DATA_URL || "biome-lookup-discrete.png";
+        let moistureMultiplier = 0.5; // Global moisture tuning from UI slider
 
         // Map settings
         const PLAYER_STARTING_POSITION_X = 10000; // Player starting x-coordinate
@@ -71,18 +94,19 @@
         const MAP_Y_MAX  = PLAYER_STARTING_POSITION_Y * 2; // Bottom y-coordinate of the map
 
         // Terrain colors for each terrain type
-        // Later, you might replace this with bitmaps or more complex textures.
+        // Palette sampled from Red Blob's biome lookup smooth gradient:
+        // https://www.redblobgames.com/maps/terrain-from-noise/images/biome-lookup-smooth.png
         const TERRAIN_COLORS = {
-            ocean: "#1f7880", // Updated ocean color
-            water: "#1f78b4",
-            beach: "#f4d78c", // Updated beach color
-            grassland: "#7cfc00",
-            plains: "#b2df8a",            
-            forest: "#228b22",
-            forest2: "#33a02c",
-            mountain: "#6a3d9a",
-            mountain2: "#bbccdd",
-            snow: "#ffffff"
+            ocean: "#28366b",
+            water: "#4c65ca",
+            beach: "#b0ad83",
+            grassland: "#8a9f78",
+            plains: "#9ca77f",
+            forest: "#77956b",
+            forest2: "#698f65",
+            mountain: "#afb999",
+            mountain2: "#babd9d",
+            snow: "#dbd9c6"
         };
 
         // Terrain model tuning
@@ -101,11 +125,14 @@
             gain: 0.5,
 
             // redistribution shaping
-            elevationExponent: 1.30,
+            elevationExponent: 1.10,
             moistureExponent: 1.05
         };
 
         const terrainCache = new Map();
+        let biomeLookupData = null;
+        let biomeLookupWidth = 0;
+        let biomeLookupHeight = 0;
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Functions
@@ -233,6 +260,7 @@
             // [Change 4] Red Blob: redistribute noise to control land/water and biome proportions.
             elevation = Math.pow(elevation, TERRAIN_MODEL.elevationExponent);
             moisture = Math.pow(moisture, TERRAIN_MODEL.moistureExponent);
+            moisture = clamp01(moisture * moistureMultiplier);
 
             // [Change 6] Temperature proxy: latitude + elevation cooling.
             const lat01 = (y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN); // 0 north .. 1 south
@@ -280,28 +308,99 @@
         // We keep one global noise seed and derive independent fields through fixed coordinate offsets.
         // This keeps map generation stable/reproducible while allowing multiple pseudo-independent signals.
 
-        function generateTerrain(x, y) {
+        function getCachedTerrainInfo(x, y) {
             const cacheKey = `${x},${y}`;
             if (USE_TERRAIN_CACHE && terrainCache.has(cacheKey)) {
                 return terrainCache.get(cacheKey);
             }
 
-            const terrain = getTerrainInfo(x, y).terrain;
+            const info = getTerrainInfo(x, y);
             if (USE_TERRAIN_CACHE) {
-                terrainCache.set(cacheKey, terrain);
+                terrainCache.set(cacheKey, info);
             }
-            return terrain;
+            return info;
+        }
+
+        function generateTerrain(x, y) {
+            return getCachedTerrainInfo(x, y).terrain;
+        }
+
+        function loadBiomeLookupTexture() {
+            const isDataUrlSource = BIOME_LOOKUP_IMAGE_URL.startsWith("data:");
+            if (window.location.protocol === "file:" && !isDataUrlSource) {
+                biomeLookupData = null; // keep fallback palette active when opened directly from disk
+                console.warn(
+                    "[biome-sample] Skipping biome lookup image on file:// due to browser CORS restrictions. " +
+                    "Run a local server (for example: python -m http.server 8000) and open http://localhost:8000/."
+                );
+                return;
+            }
+
+            const img = new Image();
+            img.crossOrigin = "anonymous";
+            img.onload = () => {
+                const sampleCanvas = document.createElement("canvas");
+                sampleCanvas.width = img.width;
+                sampleCanvas.height = img.height;
+                const sampleContext = sampleCanvas.getContext("2d");
+                sampleContext.drawImage(img, 0, 0);
+                const imageData = sampleContext.getImageData(0, 0, img.width, img.height);
+                biomeLookupData = imageData.data;
+                biomeLookupWidth = img.width;
+                biomeLookupHeight = img.height;
+                redraw(currentTransform);
+            };
+            img.onerror = () => {
+                biomeLookupData = null; // keep fallback palette active
+            };
+            img.src = BIOME_LOOKUP_IMAGE_URL;
+        }
+
+        function elevationForTerrainColor(terrain, elevation) {
+            switch (terrain) {
+                case "ocean": return 0.08;
+                case "water": return 0.33;
+                case "beach": return 0.385;
+                case "plains": return 0.50;
+                case "grassland": return 0.56;
+                case "forest": return 0.62;
+                case "forest2": return 0.66;
+                case "mountain": return Math.max(0.72, elevation);
+                case "mountain2": return Math.max(0.80, elevation);
+                case "snow": return Math.max(0.92, elevation);
+                default: return elevation;
+            }
+        }
+
+        function sampleBiomeLookupColor(terrain, moisture, elevation) {
+            if (!biomeLookupData || biomeLookupWidth <= 0 || biomeLookupHeight <= 0) {
+                return null;
+            }
+
+            const mx = clamp01(moisture);
+            const ey = clamp01(elevationForTerrainColor(terrain, elevation));
+            const px = Math.max(0, Math.min(biomeLookupWidth - 1, Math.round(mx * (biomeLookupWidth - 1))));
+            const py = Math.max(0, Math.min(biomeLookupHeight - 1, Math.round((1 - ey) * (biomeLookupHeight - 1))));
+            const idx = ((py * biomeLookupWidth) + px) * 4;
+            const r = biomeLookupData[idx];
+            const g = biomeLookupData[idx + 1];
+            const b = biomeLookupData[idx + 2];
+            return `rgb(${r}, ${g}, ${b})`;
         }
 
         // Function for turning a terrain tile into graphical output
         // At his point we assume the x and y are the top-left corner of the tile, and the size is the size of the tile.
         // Also, the coordinates are already transformed by the zoom level and translation.
         // Note that the tile may be partially visible, so you may need to draw a partial tile.
-        function drawTile(terrain, x, y, size) {
+        function drawTile(info, x, y, size) {
+            const terrain = info.terrain;
             switch(terrain) {
                 case "ocean":
                     if (USE_RANDOM_WATER_COLOR) {
                         context.fillStyle = `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`;
+                    } else if (USE_BIOME_LOOKUP_COLORS) {
+                        const sampledColor = sampleBiomeLookupColor(terrain, info.moisture, info.elevation);
+                        context.fillStyle = sampledColor || TERRAIN_COLORS.ocean;
                     } else {
                         context.fillStyle = TERRAIN_COLORS.ocean;
                     }
@@ -309,12 +408,20 @@
                 case "water":
                     if (USE_RANDOM_WATER_COLOR) {
                         context.fillStyle = `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`;
+                    } else if (USE_BIOME_LOOKUP_COLORS) {
+                        const sampledColor = sampleBiomeLookupColor(terrain, info.moisture, info.elevation);
+                        context.fillStyle = sampledColor || TERRAIN_COLORS.water;
                     } else {
                         context.fillStyle = TERRAIN_COLORS.water;
                     }
                     break;
                 default:
-                context.fillStyle = TERRAIN_COLORS[terrain];
+                    if (USE_BIOME_LOOKUP_COLORS) {
+                        const sampledColor = sampleBiomeLookupColor(terrain, info.moisture, info.elevation);
+                        context.fillStyle = sampledColor || TERRAIN_COLORS[terrain];
+                    } else {
+                        context.fillStyle = TERRAIN_COLORS[terrain];
+                    }
                 }
             context.fillRect(x, y, size, size);
         }
@@ -333,8 +440,8 @@
                 const xpos = x * tilePx + transform.x;
                 for (let y = y0; y < y1; y += 1) {
                     const ypos = y * tilePx + transform.y;
-                    const terrain = generateTerrain(x, y);
-                    tiles.push({ terrain: terrain, x: xpos, y: ypos, size: tilePx });
+                    const info = getCachedTerrainInfo(x, y);
+                    tiles.push({ info: info, x: xpos, y: ypos, size: tilePx });
                 }
             }
             return tiles;
@@ -348,7 +455,7 @@
             if (!USE_ALLOCATION_FREE_REDRAW) {
                 const tiles = computeTiles(transform);
                 tiles.forEach(tile => {
-                    drawTile(tile.terrain, tile.x, tile.y, tile.size);
+                    drawTile(tile.info, tile.x, tile.y, tile.size);
                 });
                 return;
             }
@@ -364,8 +471,8 @@
                 const xpos = x * tilePx + transform.x;
                 for (let y = y0; y < y1; y += 1) {
                     const ypos = y * tilePx + transform.y;
-                    const terrain = generateTerrain(x, y);
-                    drawTile(terrain, xpos, ypos, tilePx);
+                    const info = getCachedTerrainInfo(x, y);
+                    drawTile(info, xpos, ypos, tilePx);
                 }
             }
         }
@@ -395,6 +502,27 @@
         const tooltip = d3.select("body")
             .append("div")
             .attr("class", "tooltip");
+        const controls = d3.select("body")
+            .append("div")
+            .attr("class", "control-panel");
+        controls.append("label")
+            .attr("for", "moisture-slider")
+            .text("Moisture: 50%");
+        controls.append("input")
+            .attr("id", "moisture-slider")
+            .attr("type", "range")
+            .attr("min", "0")
+            .attr("max", "100")
+            .attr("step", "1")
+            .attr("value", "50")
+            .on("input", function() {
+                const value = Number(this.value);
+                moistureMultiplier = value / 100;
+                terrainCache.clear();
+                controls.select("label").text(`Moisture: ${value}%`);
+                redraw(currentTransform);
+            });
+        loadBiomeLookupTexture();
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Create the event listeners for resize, zoom, and keydown/keyup on the canvas and the window
@@ -466,7 +594,7 @@
             const tilePx = TILE_SIZE * currentTransform.k;
             const tileX = Math.floor((mouseX - currentTransform.x) / tilePx);
             const tileY = Math.floor((mouseY - currentTransform.y) / tilePx);
-            const info = getTerrainInfo(tileX, tileY);
+            const info = getCachedTerrainInfo(tileX, tileY);
             const color = TERRAIN_COLORS[info.terrain] || "n/a";
 
             tooltip
