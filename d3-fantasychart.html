@@ -13,8 +13,11 @@
             background-color: #f0f8ff; /* Subtiele lichtblauwe achtergrond */ 
         }
         .tooltip {
-            position: absolute;
-            text-align: center;
+            position: fixed;
+            right: 16px;
+            bottom: 16px;
+            text-align: left;
+            min-width: 18ch;
             padding: 8px;
             background: rgba(0, 0, 0, 0.55);
             color: #ffffff;
@@ -479,9 +482,7 @@
                     `Temp: ${info.temperature.toFixed(3)}<br>` +
                     `Ridge: ${info.ridge.toFixed(3)}<br>` +
                     `Zoom: ${currentTransform.k.toFixed(2)}`
-                )
-                .style("left", `${event.pageX + 10}px`)
-                .style("top", `${event.pageY - 10}px`);
+                );
         });
 
         canvas.addEventListener("mouseleave", () => {
