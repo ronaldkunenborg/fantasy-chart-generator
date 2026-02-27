@@ -7,6 +7,7 @@
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <script src="perlin.js"></script>
     <script src="biome-lookup-discrete-image-data.js"></script>
+    <script src="biome-lookup-image-data.js"></script>
     <style>
         body {
             margin: 0;
@@ -99,12 +100,13 @@
         const USE_ALLOCATION_FREE_REDRAW = true; // Toggle draw path that avoids per-frame tile-object allocation
         const USE_BIOME_LOOKUP_COLORS = true; // Use Red Blob biome lookup texture for tile colors
         const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_DISCRETE_IMAGE_DATA_URL || "biome-lookup-discrete.png";
+        // const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_IMAGE_DATA_URL || "biome-lookup-smooth.png";
         let moistureMultiplier = 0.5; // Global moisture tuning from UI slider
         let mountainMultiplier = 0.5; // Global mountain tuning from UI slider (coverage + intensity)
 
         // Map settings
-        const PLAYER_STARTING_POSITION_X = 10000; // Player starting x-coordinate
-        const PLAYER_STARTING_POSITION_Y = 10000; // Player starting y-coordinate
+        const PLAYER_STARTING_POSITION_X = 1000; // Player starting x-coordinate
+        const PLAYER_STARTING_POSITION_Y = 1000; // Player starting y-coordinate
         const MAP_X_MIN = 0;         // Top x-coordinate of the map
         const MAP_Y_MIN = 0;         // Top y-coordinate of the map
         const MAP_X_MAX = PLAYER_STARTING_POSITION_X * 2; // Bottom x-coordinate of the map
@@ -355,13 +357,13 @@
             const elevated = clamp01(elevation + mountainBoost * 0.25);
 
             // Water/coast bands first
-            if (elevated < 0.30) {
+            if (elevated < 0.08) {
                 return { terrain: "ocean", biome: "ocean", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
             }
-            if (elevated < 0.36) {
+            if (elevated < 0.10) {
                 return { terrain: "water", biome: "shallow_water", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
             }
-            if (elevated < 0.41) {
+            if (elevated < 0.12) {
                 return { terrain: "beach", biome: "coast", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
             }
 
@@ -439,9 +441,9 @@
 
         function elevationForTerrainColor(terrain, elevation) {
             switch (terrain) {
-                case "ocean": return 0.08;
-                case "water": return 0.33;
-                case "beach": return 0.385;
+                case "ocean": return 0.06;
+                case "water": return 0.09;
+                case "beach": return 0.11;
                 case "plains": return 0.50;
                 case "grassland": return 0.56;
                 case "forest": return 0.62;
