@@ -103,6 +103,7 @@
         // const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_IMAGE_DATA_URL || "biome-lookup-smooth.png";
         let moistureMultiplier = 0.5; // Global moisture tuning from UI slider
         let mountainMultiplier = 0.5; // Global mountain tuning from UI slider (coverage + intensity)
+        let islandShapeMultiplier = 0.5; // Global island edge shaping (center emphasis + coast irregularity)
 
         // Map settings
         const PLAYER_STARTING_POSITION_X = 1000; // Player starting x-coordinate
@@ -139,6 +140,8 @@
             ridgeOffsetY: -7123,
             mountainnessOffsetX: 9017,
             mountainnessOffsetY: -4561,
+            coastOffsetX: -1861,
+            coastOffsetY: 7421,
 
             // fBm settings
             octaves: 5,
@@ -148,6 +151,10 @@
             // redistribution shaping
             elevationExponent: 1.10,
             moistureExponent: 1.05,
+            islandMix: 0.55,
+            islandCoastJitterStrength: 0.18,
+            islandDistancePower: 1.10,
+            islandCoastNoiseZoom: 55,
 
             // regional terrain shaping
             mountainRegionZoom: 42,
@@ -257,7 +264,6 @@
 
         function getTerrainInfo(x, y) {
             const isOutsideMap = (x < MAP_X_MIN || x > MAP_X_MAX || y < MAP_Y_MIN || y > MAP_Y_MAX);
-            const isEdgeTile = (x === MAP_X_MIN || x === MAP_X_MAX || y === MAP_Y_MIN || y === MAP_Y_MAX);
 
             if (isOutsideMap) {
                 return {
@@ -270,19 +276,8 @@
                     zone: "outside"
                 };
             }
-            if (isEdgeTile) {
-                return {
-                    terrain: "beach",
-                    biome: "coast",
-                    elevation: 0.45,
-                    moisture: 0.5,
-                    temperature: 0.5,
-                    ridge: 0,
-                    zone: "edge"
-                };
-            }
 
-            // [Change 1] Red Blob: use multiple noise fields, not only elevation.
+            // [Item 1] Base terrain signals (Red Blob style): compute independent elevation/moisture noise fields.
             let elevation = normalizeNoise(
                 fbmNoise2(x, y, NOISE_ZOOM, TERRAIN_MODEL.elevationOffsetX, TERRAIN_MODEL.elevationOffsetY)
             );
@@ -290,14 +285,46 @@
                 fbmNoise2(x, y, NOISE_ZOOM * 1.4, TERRAIN_MODEL.moistureOffsetX, TERRAIN_MODEL.moistureOffsetY)
             );
 
-            // [Change 3] Red Blob: octave/fractal composition is implemented in fbmNoise2().
-
-            // [Change 4] Red Blob: redistribute noise to control land/water and biome proportions.
+            // [Item 2] Redistribute base noise to control global land/water and biome proportions.
             elevation = Math.pow(elevation, TERRAIN_MODEL.elevationExponent);
             moisture = Math.pow(moisture, TERRAIN_MODEL.moistureExponent);
             moisture = clamp01(moisture * moistureMultiplier);
 
-            // Create large-scale mountainous regions and deepen lowlands elsewhere.
+            // [Item 3] Replace hard rectangular edge tiles with center-distance island shaping.
+            // Distance function (radial): 0 near center, ~1 near map boundary.
+            const centerX = (MAP_X_MIN + MAP_X_MAX) * 0.5;
+            const centerY = (MAP_Y_MIN + MAP_Y_MAX) * 0.5;
+            const halfWidth = (MAP_X_MAX - MAP_X_MIN) * 0.5;
+            const halfHeight = (MAP_Y_MAX - MAP_Y_MIN) * 0.5;
+            const nx = (x - centerX) / halfWidth;
+            const ny = (y - centerY) / halfHeight;
+            let centerDistance = Math.sqrt((nx * nx) + (ny * ny));
+            centerDistance = clamp01(Math.pow(centerDistance, TERRAIN_MODEL.islandDistancePower));
+
+            // [Item 4] Add low-frequency coastline jitter so borders are irregular, not perfectly geometric.
+            const coastNoise = normalizeNoise(
+                fbmNoise2(
+                    x,
+                    y,
+                    NOISE_ZOOM * TERRAIN_MODEL.islandCoastNoiseZoom,
+                    TERRAIN_MODEL.coastOffsetX,
+                    TERRAIN_MODEL.coastOffsetY
+                )
+            );
+            const islandMixValue = clamp01(0.20 + (islandShapeMultiplier * 0.70)); // 50% -> 0.55 baseline
+            const islandJitterValue = 0.06 + (islandShapeMultiplier * 0.24); // 50% -> 0.18 baseline
+            centerDistance = clamp01(
+                centerDistance + ((coastNoise - 0.5) * islandJitterValue)
+            );
+
+            // [Item 5] Blend in an island target (1 - distance), so elevation drops toward edges naturally.
+            const islandTargetElevation = 1 - centerDistance;
+            elevation = clamp01(
+                (elevation * (1 - islandMixValue)) +
+                (islandTargetElevation * islandMixValue)
+            );
+
+            // [Item 6] Regional mountain/water shaping on top of island-form elevation.
             const mountainness = normalizeNoise(
                 fbmNoise2(
                     x,
@@ -633,6 +660,23 @@
                 mountainMultiplier = value / 100;
                 terrainCache.clear();
                 mountainLabel.text(`Mountains: ${value}%`);
+                redraw(currentTransform);
+            });
+        const islandLabel = controls.append("label")
+            .attr("for", "island-slider")
+            .text("Island Shape: 50%");
+        controls.append("input")
+            .attr("id", "island-slider")
+            .attr("type", "range")
+            .attr("min", "0")
+            .attr("max", "100")
+            .attr("step", "1")
+            .attr("value", "50")
+            .on("input", function() {
+                const value = Number(this.value);
+                islandShapeMultiplier = value / 100;
+                terrainCache.clear();
+                islandLabel.text(`Island Shape: ${value}%`);
                 redraw(currentTransform);
             });
         loadBiomeLookupTexture();
