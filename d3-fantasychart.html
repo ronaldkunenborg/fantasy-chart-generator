@@ -6,8 +6,8 @@
     <title>Fantasy Map</title>
     <link rel="stylesheet" href="d3-fantasychart.css">
     <script src="https://d3js.org/d3.v7.min.js"></script>
-    <script src="perlin.js"></script>
-    <script src="world-terrain-ranges.js"></script>
+    <script src="include/perlin.js"></script>
+    <script src="include/world-terrain-ranges.js"></script>
 </head>
 <body>
     <script>
@@ -573,7 +573,7 @@
             .append("div")
             .attr("class", "logo-panel");
         const logoImage = logoPanel.append("img")
-            .attr("src", "fantasymapgeneratorlogo.png")
+            .attr("src", "images/fantasymapgeneratorlogo.png")
             .attr("alt", "Fantasy Map Generator logo");
         const controls = d3.select("body")
             .append("div")
