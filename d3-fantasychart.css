@@ -37,6 +37,17 @@ body {
     margin-bottom: 4px;
 }
 
+.control-panel .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.control-panel .checkbox-label input[type="checkbox"] {
+    margin: 0;
+}
+
 .control-panel input[type="range"] {
     width: 180px;
 }
@@ -74,4 +85,18 @@ body {
     display: block;
     width: 100%;
     height: auto;
+}
+
+.perf-panel {
+    position: fixed;
+    left: 16px;
+    bottom: 16px;
+    z-index: 12;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #ffffff;
+    font-size: 12px;
+    font-family: monospace;
+    pointer-events: none;
 }

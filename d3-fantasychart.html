@@ -37,6 +37,7 @@
 
         // Tile settings
         const TILE_SIZE = 8;         // Size of tile in pixels
+        const MIN_TILE_PIXEL_SIZE = 1; // hard floor: tiles should never render below 1 px
         const MOVE_AMOUNT = TILE_SIZE; // Nr of pixels to move when a key is pressed
         const NOISE_ZOOM = 10;       // Zoom level for the noise function. Higher zoom gives less variation in terrain.
         const USE_TERRAIN_CACHE = true; // Toggle terrain cache for performance testing
@@ -49,9 +50,22 @@
         // Source: https://www.newgrounds.com/audio/listen/1428973
         const BACKGROUND_MUSIC_URL = "music/1428973_Magical-Forest.mp3";
         const DEFAULT_BACKGROUND_MUSIC_VOLUME = 0.35;
+        const ENABLE_PROCEDURAL_CLOUDS = true;
+        const CLOUD_COUNT = 44; // world-space cloud sprites (anchored to terrain)
+        const CLOUD_SPRITE_SIZE = 220;
+        const CLOUD_RADIUS_MIN_TILES = 14;
+        const CLOUD_RADIUS_MAX_TILES = 34;
+        const CLOUD_SPEED_MIN_TILES_PER_SEC = 2.2;
+        const CLOUD_SPEED_MAX_TILES_PER_SEC = 5.8;
+        const CLOUD_MAX_OPACITY = 0.62;
+        const CLOUD_ANIMATION_FPS = 14;
+        const CLOUD_DENSITY_SLIDER_SCALE = 1.56; // slider 50% maps to effective density 0.78
+        const MIN_TEXTURE_TILE_PIXEL_SIZE = 3; // below this, use flat colors instead of textures
         let moistureMultiplier = 0.5; // Global moisture tuning from UI slider
         let mountainMultiplier = 0.5; // Global mountain tuning from UI slider (coverage + intensity)
         let islandShapeMultiplier = 0.5; // Global island edge shaping (center emphasis + coast irregularity)
+        let cloudDensityMultiplier = 0.78; // Effective cloud amount/opacity after slider scaling
+        let useIceColorBlending = true; // Toggle for performance testing
 
         // Map settings
         const PLAYER_STARTING_POSITION_X = 1000; // Player starting x-coordinate
@@ -62,28 +76,29 @@
         const MAP_Y_MAX  = PLAYER_STARTING_POSITION_Y * 2; // Bottom y-coordinate of the map
 
         // Terrain fallback colors for each terrain type (used when no texture is available).
+        // Values tuned to match average colors of the generated textures in /textures.
         const TERRAIN_COLORS = {
             ocean: "#37498b",
             water: "#6b81da",
             ocean_ice: "#b9c9e3",
             water_ice: "#d4e3f2",
-            beach: "#cfcb89",
-            desert: "#cfcb89",
-            shrubland: "#a7c576",
-            grassland: "#5fa323",
-            plains: "#a7c576",
-            temperate_forest: "#356b47",
-            rainforest: "#698f65",
-            taiga: "#698f65",
-            tundra: "#d0d1c4",
-            forest: "#356b47",
-            forest2: "#698f65",
-            alpine: "#d0d1c4",
-            alpine_tundra: "#d0d1c4",
-            mountaintop: "#ffffff",
-            mountain: "#afb999",
-            mountain2: "#d0d1c4",
-            snow: "#ffffff"
+            beach: "#d3ba75",
+            desert: "#d3ba75",
+            shrubland: "#8fa369",
+            grassland: "#6ca549",
+            plains: "#98b06a",
+            temperate_forest: "#487c50",
+            rainforest: "#2a6740",
+            taiga: "#647e6b",
+            tundra: "#929a9c",
+            forest: "#40744c",
+            forest2: "#487c50",
+            alpine: "#bebdb7",
+            alpine_tundra: "#a4a9b3",
+            mountaintop: "#edf0f8",
+            mountain: "#95938d",
+            mountain2: "#a4a9b3",
+            snow: "#edf0f8"
         };
         const OCEAN_ICE_TEMPERATURE_START = 0.18;
         const OCEAN_ICE_TEMPERATURE_END = 0.30;
@@ -148,6 +163,10 @@
         const terrainCache = new Map();
         const terrainPatternCache = new Map();
         const terrainPatternLoadState = new Map();
+        let terrainLayerCanvas = null;
+        let terrainLayerContext = null;
+        const cloudSprites = [];
+        let renderMsEma = 0;
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Functions
@@ -512,7 +531,7 @@
             return `${textureBiome}_${temperatureBand}_${moistureBand}`;
         }
 
-        function getTerrainPattern(info) {
+        function getTerrainPattern(info, targetContext = context) {
             if (!USE_TERRAIN_TEXTURES) {
                 return null;
             }
@@ -532,7 +551,7 @@
             terrainPatternLoadState.set(variant, "loading");
             const img = new Image();
             img.onload = () => {
-                const pattern = context.createPattern(img, "repeat");
+                const pattern = targetContext.createPattern(img, "repeat");
                 if (pattern) {
                     terrainPatternCache.set(variant, pattern);
                     terrainPatternLoadState.set(variant, "ready");
@@ -552,7 +571,7 @@
         // At his point we assume the x and y are the top-left corner of the tile, and the size is the size of the tile.
         // Also, the coordinates are already transformed by the zoom level and translation.
         // Note that the tile may be partially visible, so you may need to draw a partial tile.
-        function drawTile(info, x, y, size) {
+        function drawTile(info, x, y, size, targetContext = context) {
             // Snap to device pixels to prevent anti-aliased seams between adjacent tiles.
             const x0 = Math.floor(x);
             const y0 = Math.floor(y);
@@ -561,37 +580,38 @@
             const drawW = Math.max(1, x1 - x0);
             const drawH = Math.max(1, y1 - y0);
 
-            const pattern = getTerrainPattern(info);
+            // Below 3 px, textures lose detail and cost more than they add; use flat color fallback.
+            const pattern = (size >= MIN_TEXTURE_TILE_PIXEL_SIZE) ? getTerrainPattern(info, targetContext) : null;
             if (pattern) {
-                context.fillStyle = pattern;
-                context.fillRect(x0, y0, drawW, drawH);
+                targetContext.fillStyle = pattern;
+                targetContext.fillRect(x0, y0, drawW, drawH);
                 return;
             }
 
             const terrain = info.terrain;
             switch (terrain) {
                 case "ocean":
-                    if (info.oceanIceFactor > 0.01) {
-                        context.fillStyle = mixHexColors(TERRAIN_COLORS.ocean, TERRAIN_COLORS.ocean_ice, info.oceanIceFactor);
+                    if (useIceColorBlending && info.oceanIceFactor > 0.01) {
+                        targetContext.fillStyle = mixHexColors(TERRAIN_COLORS.ocean, TERRAIN_COLORS.ocean_ice, info.oceanIceFactor);
                     } else {
-                        context.fillStyle = USE_RANDOM_WATER_COLOR
+                        targetContext.fillStyle = USE_RANDOM_WATER_COLOR
                             ? `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`
                             : TERRAIN_COLORS.ocean;
                     }
                     break;
                 case "water":
-                    if (info.waterIceFactor > 0.01) {
-                        context.fillStyle = mixHexColors(TERRAIN_COLORS.water, TERRAIN_COLORS.water_ice, info.waterIceFactor);
+                    if (useIceColorBlending && info.waterIceFactor > 0.01) {
+                        targetContext.fillStyle = mixHexColors(TERRAIN_COLORS.water, TERRAIN_COLORS.water_ice, info.waterIceFactor);
                     } else {
-                        context.fillStyle = USE_RANDOM_WATER_COLOR
+                        targetContext.fillStyle = USE_RANDOM_WATER_COLOR
                             ? `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`
                             : TERRAIN_COLORS.water;
                     }
                     break;
                 default:
-                    context.fillStyle = TERRAIN_COLORS[terrain] || "#ff00ff";
+                    targetContext.fillStyle = TERRAIN_COLORS[terrain] || "#ff00ff";
             }
-            context.fillRect(x0, y0, drawW, drawH);
+            targetContext.fillRect(x0, y0, drawW, drawH);
         }
 
         // Compute visible world tile range directly from transform (no player-position projection).
@@ -615,15 +635,112 @@
             return tiles;
         }
 
+        function createCloudSprite(size) {
+            const sprite = document.createElement("canvas");
+            sprite.width = size;
+            sprite.height = size;
+            const spriteCtx = sprite.getContext("2d");
+            const center = size * 0.5;
+            const cloudSeed = Math.random();
 
-        // The redraw function will clear the canvas and draw the tiles that are visible on the screen.
-        function redraw(transform) {
-            context.clearRect(0, 0, canvas.width, canvas.height);
+            for (let i = 0; i < 5; i += 1) {
+                const radius = (size * (0.18 + (Math.random() * 0.14)));
+                const angle = ((Math.PI * 2) * (i / 5)) + (cloudSeed * Math.PI);
+                const distance = size * (0.06 + (Math.random() * 0.15));
+                const px = center + (Math.cos(angle) * distance);
+                const py = center + (Math.sin(angle) * distance * 0.7);
+                const gradient = spriteCtx.createRadialGradient(px, py, radius * 0.2, px, py, radius);
+                gradient.addColorStop(0, "rgba(255,255,255,0.90)");
+                gradient.addColorStop(0.55, "rgba(255,255,255,0.45)");
+                gradient.addColorStop(1, "rgba(255,255,255,0)");
+                spriteCtx.fillStyle = gradient;
+                spriteCtx.beginPath();
+                spriteCtx.arc(px, py, radius, 0, Math.PI * 2);
+                spriteCtx.fill();
+            }
+
+            const broad = spriteCtx.createRadialGradient(center, center, size * 0.08, center, center, size * 0.5);
+            broad.addColorStop(0, "rgba(255,255,255,0.38)");
+            broad.addColorStop(1, "rgba(255,255,255,0)");
+            spriteCtx.fillStyle = broad;
+            spriteCtx.fillRect(0, 0, size, size);
+            return sprite;
+        }
+
+        function initializeCloudSprites() {
+            if (!ENABLE_PROCEDURAL_CLOUDS) {
+                return;
+            }
+            cloudSprites.length = 0;
+            const worldWidth = (MAP_X_MAX - MAP_X_MIN + 1);
+            const worldHeight = (MAP_Y_MAX - MAP_Y_MIN + 1);
+            for (let i = 0; i < CLOUD_COUNT; i += 1) {
+                const radiusTiles =
+                    CLOUD_RADIUS_MIN_TILES +
+                    (Math.random() * (CLOUD_RADIUS_MAX_TILES - CLOUD_RADIUS_MIN_TILES));
+                const speedX =
+                    CLOUD_SPEED_MIN_TILES_PER_SEC +
+                    (Math.random() * (CLOUD_SPEED_MAX_TILES_PER_SEC - CLOUD_SPEED_MIN_TILES_PER_SEC));
+                const speedY = (Math.random() - 0.5) * 0.9;
+                cloudSprites.push({
+                    worldX: MAP_X_MIN + (Math.random() * worldWidth),
+                    worldY: MAP_Y_MIN + (Math.random() * worldHeight),
+                    radiusTiles: radiusTiles,
+                    speedX: speedX,
+                    speedY: speedY,
+                    opacity: 0.35 + (Math.random() * 0.45),
+                    sprite: createCloudSprite(CLOUD_SPRITE_SIZE)
+                });
+            }
+        }
+
+        function drawCloudOverlay(transform) {
+            if (!ENABLE_PROCEDURAL_CLOUDS || cloudDensityMultiplier <= 0.01) {
+                return;
+            }
+
+            const tilePx = TILE_SIZE * transform.k;
+            const worldWidth = (MAP_X_MAX - MAP_X_MIN + 1);
+            const worldHeight = (MAP_Y_MAX - MAP_Y_MIN + 1);
+            const activeCount = Math.max(
+                1,
+                Math.min(
+                    cloudSprites.length,
+                    Math.round(cloudSprites.length * (0.2 + (cloudDensityMultiplier * 0.8)))
+                )
+            );
+            const wrapPadding = 300;
+
+            for (let i = 0; i < activeCount; i += 1) {
+                const cloud = cloudSprites[i];
+                const wrappedX = MAP_X_MIN + (((cloud.worldX - MAP_X_MIN) % worldWidth) + worldWidth) % worldWidth;
+                const wrappedY = MAP_Y_MIN + (((cloud.worldY - MAP_Y_MIN) % worldHeight) + worldHeight) % worldHeight;
+                const radiusPx = cloud.radiusTiles * tilePx;
+                const sizePx = radiusPx * 2;
+                const sx = (wrappedX * tilePx) + transform.x - radiusPx;
+                const sy = (wrappedY * tilePx) + transform.y - radiusPx;
+
+                if (sx > canvas.width + wrapPadding || sy > canvas.height + wrapPadding || sx + sizePx < -wrapPadding || sy + sizePx < -wrapPadding) {
+                    continue;
+                }
+
+                context.globalAlpha = Math.min(1, cloud.opacity * cloudDensityMultiplier * CLOUD_MAX_OPACITY);
+                context.drawImage(cloud.sprite, sx, sy, sizePx, sizePx);
+            }
+            context.globalAlpha = 1;
+        }
+
+        function renderTerrainLayer(transform) {
+            if (!terrainLayerCanvas || !terrainLayerContext) {
+                return;
+            }
+
+            terrainLayerContext.clearRect(0, 0, terrainLayerCanvas.width, terrainLayerCanvas.height);
 
             if (!USE_ALLOCATION_FREE_REDRAW) {
                 const tiles = computeTiles(transform);
                 tiles.forEach(tile => {
-                    drawTile(tile.info, tile.x, tile.y, tile.size);
+                    drawTile(tile.info, tile.x, tile.y, tile.size, terrainLayerContext);
                 });
                 return;
             }
@@ -640,9 +757,32 @@
                 for (let y = y0; y < y1; y += 1) {
                     const ypos = y * tilePx + transform.y;
                     const info = getCachedTerrainInfo(x, y);
-                    drawTile(info, xpos, ypos, tilePx);
+                    drawTile(info, xpos, ypos, tilePx, terrainLayerContext);
                 }
             }
+        }
+
+        function composeFrame(transform) {
+            const frameStart = performance.now();
+            if (!terrainLayerCanvas) {
+                return;
+            }
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(terrainLayerCanvas, 0, 0);
+            drawCloudOverlay(transform);
+            const renderMs = performance.now() - frameStart;
+            renderMsEma = (renderMsEma === 0) ? renderMs : ((renderMsEma * 0.85) + (renderMs * 0.15));
+            perfPanel.text(`Render: ${renderMsEma.toFixed(2)} ms`);
+        }
+
+        // Redraw terrain layer only when world/camera changed; clouds animate on top separately.
+        function redraw(transform) {
+            const redrawStart = performance.now();
+            renderTerrainLayer(transform);
+            composeFrame(transform);
+            const totalMs = performance.now() - redrawStart;
+            const totalMsEma = (renderMsEma * 0.6) + (totalMs * 0.4);
+            perfPanel.text(`Render: ${totalMsEma.toFixed(2)} ms`);
         }
 
 
@@ -668,6 +808,12 @@
         document.body.appendChild(canvas);
         const context = canvas.getContext("2d");
         context.imageSmoothingEnabled = false;
+        terrainLayerCanvas = document.createElement("canvas");
+        terrainLayerCanvas.width = canvas.width;
+        terrainLayerCanvas.height = canvas.height;
+        terrainLayerContext = terrainLayerCanvas.getContext("2d");
+        terrainLayerContext.imageSmoothingEnabled = false;
+        initializeCloudSprites();
         const tooltip = d3.select("body")
             .append("div")
             .attr("class", "tooltip");
@@ -677,6 +823,10 @@
         const logoImage = logoPanel.append("img")
             .attr("src", "images/fantasymapgeneratorlogo.png")
             .attr("alt", "Fantasy Map Generator logo");
+        const perfPanel = d3.select("body")
+            .append("div")
+            .attr("class", "perf-panel")
+            .text("Render: -- ms");
         const controls = d3.select("body")
             .append("div")
             .attr("class", "control-panel");
@@ -738,6 +888,22 @@
                 islandLabel.text(`Island Shape: ${value}%`);
                 redraw(currentTransform);
             });
+        const cloudLabel = controls.append("label")
+            .attr("for", "cloud-slider")
+            .text("Clouds: 50%");
+        controls.append("input")
+            .attr("id", "cloud-slider")
+            .attr("type", "range")
+            .attr("min", "0")
+            .attr("max", "100")
+            .attr("step", "1")
+            .attr("value", "50")
+            .on("input", function() {
+                const value = Number(this.value);
+                cloudDensityMultiplier = (value / 100) * CLOUD_DENSITY_SLIDER_SCALE;
+                cloudLabel.text(`Clouds: ${value}%`);
+                composeFrame(currentTransform);
+            });
 
         const backgroundMusic = new Audio(BACKGROUND_MUSIC_URL);
         backgroundMusic.loop = true;
@@ -765,6 +931,18 @@
                 backgroundMusic.volume = Math.max(0, Math.min(1, value / 100));
                 musicVolumeLabel.text(`Music Volume: ${value}%`);
             });
+        const iceBlendLabel = controls.append("label")
+            .attr("for", "ice-blend-toggle")
+            .attr("class", "checkbox-label");
+        iceBlendLabel.append("input")
+            .attr("id", "ice-blend-toggle")
+            .attr("type", "checkbox")
+            .property("checked", true)
+            .on("change", function() {
+                useIceColorBlending = !!this.checked;
+                redraw(currentTransform);
+            });
+        iceBlendLabel.append("span").text("Ice Blend");
 
         function syncMusicButtonState() {
             const isPlaying = !backgroundMusic.paused && !backgroundMusic.ended;
@@ -851,7 +1029,7 @@
         // Keep zoom behavior simple like d3-fantasychart3:
         // let D3 manage wheel zoom focus natively (world point under cursor stays fixed).
         const zoomBehavior = d3.zoom()
-            .scaleExtent([1, 8])
+            .scaleExtent([MIN_TILE_PIXEL_SIZE / TILE_SIZE, 8])
             .on("zoom", (event) => {
                 const clamped = clampCameraTransform(event.transform);
                 const changed =
@@ -887,6 +1065,9 @@
             resizeTimeout = setTimeout(() => {
                 canvas.width = window.innerWidth;
                 canvas.height = window.innerHeight;
+                terrainLayerCanvas.width = canvas.width;
+                terrainLayerCanvas.height = canvas.height;
+                initializeCloudSprites();
 
                 // Reapply the old currentTransform after resizing
                 // This prevents the map from jumping around when resizing
@@ -965,6 +1146,46 @@
             }
         }
 
+        function updateCloudSprites(deltaSeconds) {
+            if (!ENABLE_PROCEDURAL_CLOUDS || cloudDensityMultiplier <= 0.01) {
+                return;
+            }
+            const worldWidth = (MAP_X_MAX - MAP_X_MIN + 1);
+            const worldHeight = (MAP_Y_MAX - MAP_Y_MIN + 1);
+            for (let i = 0; i < cloudSprites.length; i += 1) {
+                const cloud = cloudSprites[i];
+                cloud.worldX += cloud.speedX * deltaSeconds;
+                cloud.worldY += cloud.speedY * deltaSeconds;
+                cloud.worldX = MAP_X_MIN + (((cloud.worldX - MAP_X_MIN) % worldWidth) + worldWidth) % worldWidth;
+                cloud.worldY = MAP_Y_MIN + (((cloud.worldY - MAP_Y_MIN) % worldHeight) + worldHeight) % worldHeight;
+            }
+        }
+
+        function startCloudAnimationLoop() {
+            if (!ENABLE_PROCEDURAL_CLOUDS) {
+                return;
+            }
+
+            const minFrameMs = 1000 / CLOUD_ANIMATION_FPS;
+            let lastTickTs = 0;
+
+            function tick(ts) {
+                if (lastTickTs === 0) {
+                    lastTickTs = ts;
+                }
+                const frameDeltaMs = ts - lastTickTs;
+                if (frameDeltaMs >= minFrameMs) {
+                    const deltaSeconds = Math.min(0.12, frameDeltaMs * 0.001);
+                    updateCloudSprites(deltaSeconds);
+                    composeFrame(currentTransform);
+                    lastTickTs = ts;
+                }
+                requestAnimationFrame(tick);
+            }
+
+            requestAnimationFrame(tick);
+        }
+
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Finish up and show the initial screen
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -975,6 +1196,7 @@
 
         // Draw the initial screen
         redraw(currentTransform);
+        startCloudAnimationLoop();
     </script>
 </body>
 </html>
