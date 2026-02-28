@@ -1,0 +1,77 @@
+body {
+    margin: 0;
+    overflow: hidden;
+    background-color: #f0f8ff; /* Subtiele lichtblauwe achtergrond */
+}
+
+.tooltip {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    text-align: left;
+    min-width: 18ch;
+    padding: 8px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #ffffff;
+    border-radius: 4px;
+    pointer-events: none;
+    font-size: 12px;
+    opacity: 0;
+}
+
+.control-panel {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 10;
+    padding: 8px 10px;
+    background: rgba(0, 0, 0, 0.55);
+    color: #ffffff;
+    border-radius: 4px;
+    font-size: 12px;
+    font-family: sans-serif;
+}
+
+.control-panel label {
+    display: block;
+    margin-bottom: 4px;
+}
+
+.control-panel input[type="range"] {
+    width: 180px;
+}
+
+.control-panel button {
+    display: block;
+    width: 100%;
+    margin: 8px 0 4px 0;
+    padding: 6px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.12);
+    color: #ffffff;
+    cursor: pointer;
+    font-size: 12px;
+}
+
+.control-panel button:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+.logo-panel {
+    position: fixed;
+    top: 16px;
+    right: 16px;
+    z-index: 11;
+    width: 180px;
+    padding: 0;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+.logo-panel img {
+    display: block;
+    width: 100%;
+    height: auto;
+}
