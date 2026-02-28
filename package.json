@@ -1,0 +1,12 @@
+{
+  "name": "fantasy chart texture generator",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Texture generator for fantasy biome tiles",
+  "scripts": {
+    "generate:textures": "node scripts/generate-terrain-textures.js"
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0"
+  }
+}

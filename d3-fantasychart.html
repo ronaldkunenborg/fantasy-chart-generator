@@ -6,8 +6,6 @@
     <title>Fantasy Map</title>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <script src="perlin.js"></script>
-    <script src="biome-lookup-discrete-image-data.js"></script>
-    <script src="biome-lookup-image-data.js"></script>
     <style>
         body {
             margin: 0;
@@ -98,9 +96,8 @@
         const USE_TERRAIN_CACHE = true; // Toggle terrain cache for performance testing
         const USE_RANDOM_WATER_COLOR = false; // Toggle random water/ocean shading
         const USE_ALLOCATION_FREE_REDRAW = true; // Toggle draw path that avoids per-frame tile-object allocation
-        const USE_BIOME_LOOKUP_COLORS = true; // Use Red Blob biome lookup texture for tile colors
-        const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_DISCRETE_IMAGE_DATA_URL || "biome-lookup-discrete.png";
-        // const BIOME_LOOKUP_IMAGE_URL = window.BIOME_LOOKUP_IMAGE_DATA_URL || "biome-lookup-smooth.png";
+        const USE_TERRAIN_TEXTURES = true; // Render selected terrains with image-like texture patterns
+        const TERRAIN_TEXTURE_ROOT = "textures"; // Folder with generated biome texture PNG files
         let moistureMultiplier = 0.5; // Global moisture tuning from UI slider
         let mountainMultiplier = 0.5; // Global mountain tuning from UI slider (coverage + intensity)
         let islandShapeMultiplier = 0.5; // Global island edge shaping (center emphasis + coast irregularity)
@@ -113,21 +110,337 @@
         const MAP_X_MAX = PLAYER_STARTING_POSITION_X * 2; // Bottom x-coordinate of the map
         const MAP_Y_MAX  = PLAYER_STARTING_POSITION_Y * 2; // Bottom y-coordinate of the map
 
-        // Terrain colors for each terrain type
-        // Palette sampled from Red Blob's biome lookup smooth gradient:
-        // https://www.redblobgames.com/maps/terrain-from-noise/images/biome-lookup-smooth.png
+        // Terrain fallback colors for each terrain type (used when no texture is available).
         const TERRAIN_COLORS = {
             ocean: "#37498b",
             water: "#6b81da",
             beach: "#cfcb89",
+            desert: "#cfcb89",
+            shrubland: "#a7c576",
             grassland: "#5fa323",
             plains: "#a7c576",
+            temperate_forest: "#356b47",
+            rainforest: "#698f65",
+            taiga: "#698f65",
+            tundra: "#d0d1c4",
             forest: "#356b47",
             forest2: "#698f65",
+            alpine: "#d0d1c4",
+            alpine_tundra: "#d0d1c4",
+            mountaintop: "#ffffff",
             mountain: "#afb999",
             mountain2: "#d0d1c4",
             snow: "#ffffff"
         };
+
+        // World terrain/biome reference ranges for later biome correlation work.
+        // Temperature + precipitation values are based on NASA "Mission: Biomes":
+        // https://science.nasa.gov/kids/earth/mission-biomes/
+        // (desert, tundra, grassland, rainforest, shrubland, coniferous, temperate deciduous)
+        // Elevation bands are practical global terrain heuristics (typical occurrence bands).
+        // `elevationNorm` uses this map's internal 0..1 elevation space.
+        // `moistureNorm` is a 0..1 moisture proxy tuned to this project model.
+        const WORLD_TERRAIN_RANGES = [
+            // Marine
+            {
+                terrainType: "abyssal_ocean",
+                elevationMeters: [-11000, -4000],
+                elevationNorm: [0.00, 0.22],
+                moistureNorm: [0.95, 1.00],
+                temperatureC: [-1, 4]
+            },
+            {
+                terrainType: "deep_ocean",
+                elevationMeters: [-4000, -200],
+                elevationNorm: [0.12, 0.34],
+                moistureNorm: [0.90, 1.00],
+                temperatureC: [-1, 25]
+            },
+            {
+                terrainType: "continental_shelf",
+                elevationMeters: [-200, 0],
+                elevationNorm: [0.30, 0.38],
+                moistureNorm: [0.85, 1.00],
+                temperatureC: [-2, 30]
+            },
+            {
+                terrainType: "coastal_water",
+                elevationMeters: [-50, 5],
+                elevationNorm: [0.36, 0.40],
+                moistureNorm: [0.80, 1.00],
+                temperatureC: [-2, 32]
+            },
+
+            // Coastal lowlands
+            {
+                terrainType: "beach",
+                elevationMeters: [0, 50],
+                elevationNorm: [0.39, 0.43],
+                moistureNorm: [0.20, 0.95],
+                temperatureC: [-5, 45]
+            },
+            {
+                terrainType: "dunes",
+                elevationMeters: [0, 300],
+                elevationNorm: [0.41, 0.48],
+                moistureNorm: [0.02, 0.20],
+                precipitationMmYear: [0, 250],
+                temperatureC: [10, 50]
+            },
+            {
+                terrainType: "salt_marsh",
+                elevationMeters: [0, 20],
+                elevationNorm: [0.39, 0.42],
+                moistureNorm: [0.75, 1.00],
+                precipitationMmYear: [400, 2000],
+                temperatureC: [-5, 35]
+            },
+            {
+                terrainType: "delta_floodplain",
+                elevationMeters: [0, 200],
+                elevationNorm: [0.41, 0.50],
+                moistureNorm: [0.65, 1.00],
+                precipitationMmYear: [500, 3000],
+                temperatureC: [0, 35]
+            },
+            {
+                terrainType: "mangrove_coast",
+                elevationMeters: [0, 30],
+                elevationNorm: [0.39, 0.43],
+                moistureNorm: [0.80, 1.00],
+                precipitationMmYear: [1200, 3000],
+                temperatureC: [20, 35]
+            },
+
+            // Arid and semi-arid
+            {
+                terrainType: "desert_hot",
+                elevationMeters: [-50, 2500],
+                elevationNorm: [0.42, 0.74],
+                moistureNorm: [0.00, 0.12],
+                precipitationMmYear: [0, 250],
+                temperatureC: [18, 50]
+            },
+            {
+                terrainType: "desert_cold",
+                elevationMeters: [200, 4200],
+                elevationNorm: [0.50, 0.82],
+                moistureNorm: [0.00, 0.15],
+                precipitationMmYear: [0, 250],
+                temperatureC: [-25, 20]
+            },
+            {
+                terrainType: "semi_arid_steppe",
+                elevationMeters: [0, 2500],
+                elevationNorm: [0.45, 0.72],
+                moistureNorm: [0.12, 0.32],
+                precipitationMmYear: [250, 500],
+                temperatureC: [-10, 35]
+            },
+            {
+                terrainType: "badlands",
+                elevationMeters: [200, 1800],
+                elevationNorm: [0.50, 0.70],
+                moistureNorm: [0.03, 0.20],
+                precipitationMmYear: [100, 500],
+                temperatureC: [-5, 40]
+            },
+
+            // Grass and shrub domains
+            {
+                terrainType: "savanna",
+                elevationMeters: [0, 1500],
+                elevationNorm: [0.45, 0.66],
+                moistureNorm: [0.28, 0.58],
+                precipitationMmYear: [500, 1500],
+                temperatureC: [18, 32]
+            },
+            {
+                terrainType: "prairie_temperate_grassland",
+                elevationMeters: [0, 1800],
+                elevationNorm: [0.44, 0.66],
+                moistureNorm: [0.30, 0.55],
+                precipitationMmYear: [500, 900],
+                temperatureC: [-20, 30]
+            },
+            {
+                terrainType: "chaparral_mediterranean_shrubland",
+                elevationMeters: [0, 1600],
+                elevationNorm: [0.46, 0.68],
+                moistureNorm: [0.20, 0.45],
+                precipitationMmYear: [300, 900],
+                temperatureC: [5, 35]
+            },
+
+            // Forest domains
+            {
+                terrainType: "temperate_deciduous_forest",
+                elevationMeters: [0, 1500],
+                elevationNorm: [0.50, 0.72],
+                moistureNorm: [0.45, 0.75],
+                precipitationMmYear: [750, 1500],
+                temperatureC: [-30, 30]
+            },
+            {
+                terrainType: "temperate_rainforest",
+                elevationMeters: [0, 1200],
+                elevationNorm: [0.50, 0.74],
+                moistureNorm: [0.70, 1.00],
+                precipitationMmYear: [1400, 3500],
+                temperatureC: [4, 20]
+            },
+            {
+                terrainType: "coniferous_forest_taiga",
+                elevationMeters: [100, 3000],
+                elevationNorm: [0.52, 0.78],
+                moistureNorm: [0.20, 0.55],
+                precipitationMmYear: [300, 900],
+                temperatureC: [-40, 20]
+            },
+            {
+                terrainType: "tropical_seasonal_forest",
+                elevationMeters: [0, 1300],
+                elevationNorm: [0.48, 0.72],
+                moistureNorm: [0.55, 0.82],
+                precipitationMmYear: [1000, 2000],
+                temperatureC: [18, 32]
+            },
+            {
+                terrainType: "tropical_rainforest",
+                elevationMeters: [0, 1200],
+                elevationNorm: [0.48, 0.74],
+                moistureNorm: [0.75, 1.00],
+                precipitationMmYear: [2000, 10000],
+                temperatureC: [20, 30]
+            },
+            {
+                terrainType: "cloud_forest",
+                elevationMeters: [1200, 3500],
+                elevationNorm: [0.62, 0.84],
+                moistureNorm: [0.70, 1.00],
+                precipitationMmYear: [1500, 4000],
+                temperatureC: [8, 20]
+            },
+
+            // Wetlands and inland water
+            {
+                terrainType: "wetland_marsh",
+                elevationMeters: [0, 400],
+                elevationNorm: [0.42, 0.55],
+                moistureNorm: [0.75, 1.00],
+                precipitationMmYear: [600, 3000],
+                temperatureC: [-5, 35]
+            },
+            {
+                terrainType: "bog_fen",
+                elevationMeters: [0, 900],
+                elevationNorm: [0.45, 0.62],
+                moistureNorm: [0.80, 1.00],
+                precipitationMmYear: [500, 2500],
+                temperatureC: [-10, 20]
+            },
+            {
+                terrainType: "swamp",
+                elevationMeters: [0, 250],
+                elevationNorm: [0.42, 0.54],
+                moistureNorm: [0.80, 1.00],
+                precipitationMmYear: [1000, 3000],
+                temperatureC: [10, 35]
+            },
+            {
+                terrainType: "lake_inland_water",
+                elevationMeters: [0, 4500],
+                elevationNorm: [0.36, 0.58],
+                moistureNorm: [0.70, 1.00],
+                temperatureC: [-2, 30]
+            },
+
+            // Upland and mountain systems
+            {
+                terrainType: "hills_foothills",
+                elevationMeters: [200, 1500],
+                elevationNorm: [0.56, 0.70],
+                moistureNorm: [0.20, 0.80],
+                temperatureC: [-10, 30]
+            },
+            {
+                terrainType: "plateau",
+                elevationMeters: [800, 3500],
+                elevationNorm: [0.62, 0.82],
+                moistureNorm: [0.10, 0.60],
+                temperatureC: [-15, 25]
+            },
+            {
+                terrainType: "mountain",
+                elevationMeters: [600, 4500],
+                elevationNorm: [0.64, 0.86],
+                moistureNorm: [0.15, 0.85],
+                temperatureC: [-20, 20]
+            },
+            {
+                terrainType: "montane_forest",
+                elevationMeters: [900, 3200],
+                elevationNorm: [0.66, 0.84],
+                moistureNorm: [0.40, 0.90],
+                precipitationMmYear: [600, 3000],
+                temperatureC: [-5, 20]
+            },
+            {
+                terrainType: "subalpine",
+                elevationMeters: [1800, 3600],
+                elevationNorm: [0.74, 0.90],
+                moistureNorm: [0.25, 0.80],
+                temperatureC: [-15, 15]
+            },
+            {
+                terrainType: "alpine_tundra",
+                elevationMeters: [2500, 5000],
+                elevationNorm: [0.82, 0.96],
+                moistureNorm: [0.08, 0.40],
+                precipitationMmYear: [100, 700],
+                temperatureC: [-30, 10]
+            },
+            {
+                terrainType: "volcanic_highland",
+                elevationMeters: [500, 4500],
+                elevationNorm: [0.64, 0.94],
+                moistureNorm: [0.10, 0.95],
+                precipitationMmYear: [200, 4000],
+                temperatureC: [-15, 28]
+            },
+            {
+                terrainType: "geothermal_plain",
+                elevationMeters: [50, 1800],
+                elevationNorm: [0.48, 0.74],
+                moistureNorm: [0.20, 0.95],
+                temperatureC: [-5, 25]
+            },
+
+            // Polar / cryosphere
+            {
+                terrainType: "tundra",
+                elevationMeters: [0, 3500],
+                elevationNorm: [0.52, 0.84],
+                moistureNorm: [0.05, 0.25],
+                precipitationMmYear: [150, 350],
+                temperatureC: [-40, 18]
+            },
+            {
+                terrainType: "glacier_icefield",
+                elevationMeters: [0, 5000],
+                elevationNorm: [0.72, 1.00],
+                moistureNorm: [0.20, 0.95],
+                precipitationMmYear: [100, 2000],
+                temperatureC: [-50, 0]
+            },
+            {
+                terrainType: "nival_snow_ice",
+                elevationMeters: [2500, 8849],
+                elevationNorm: [0.86, 1.00],
+                moistureNorm: [0.10, 0.95],
+                temperatureC: [-50, 0]
+            }
+        ];
 
         // Terrain model tuning
         const TERRAIN_MODEL = {
@@ -172,9 +485,8 @@
         };
 
         const terrainCache = new Map();
-        let biomeLookupData = null;
-        let biomeLookupWidth = 0;
-        let biomeLookupHeight = 0;
+        const terrainPatternCache = new Map();
+        const terrainPatternLoadState = new Map();
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Functions
@@ -221,8 +533,12 @@
             return 1.0 - Math.abs(n); // [0..1] with sharp ridges near 1
         }
 
-        function pickBiome(temperature, moisture) {
-            // [Change 2] Red Blob: biomes from elevation+moisture (plus temp proxy here).
+        function pickBiome(temperature, moisture, finalElevation, ridge) {
+            // Name biome from final (post-ridge) elevation first, then climate.
+            if (finalElevation > 0.86) return "mountaintop";
+            if (finalElevation > 0.76) return ridge > 0.65 ? "alpine" : "mountain";
+            if (finalElevation > 0.66 && temperature < 0.35) return "alpine_tundra";
+
             if (temperature < 0.20) return (moisture < 0.45 ? "tundra" : "snow");
             if (temperature < 0.35) return (moisture < 0.35 ? "tundra" : "taiga");
             if (temperature < 0.55) {
@@ -237,26 +553,23 @@
         }
 
         function biomeToTerrain(biome) {
-            // [Change 5] Separate biome decision from final terrain rendering category.
+            // Keep terrain names aligned with biome names unless a remap is required.
             switch (biome) {
                 case "desert":
-                    return "beach";
                 case "plains":
-                    return "plains";
                 case "grassland":
-                    return "grassland";
                 case "shrubland":
-                    return "plains";
                 case "temperate_forest":
-                    return "forest";
                 case "rainforest":
-                    return "forest2";
                 case "taiga":
-                    return "forest2";
+                case "forest":
                 case "tundra":
-                    return "mountain2";
+                case "mountain":
+                case "alpine":
+                case "alpine_tundra":
+                case "mountaintop":
                 case "snow":
-                    return "snow";
+                    return biome;
                 default:
                     return "grassland";
             }
@@ -394,14 +707,9 @@
                 return { terrain: "beach", biome: "coast", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
             }
 
-            // [Change 2] Biome selection from moisture + temperature.
-            const biome = pickBiome(temperature, moisture);
-            let terrain = biomeToTerrain(biome);
-
-            // High elevation override to mountain/snow families.
-            if (elevated > 0.82) terrain = "snow";
-            else if (elevated > 0.74) terrain = ridge > 0.65 ? "mountain2" : "mountain";
-            else if (elevated > 0.64) terrain = ridge > 0.70 ? "mountain" : terrain;
+            // Biome selection after ridge application, based on final elevation.
+            const biome = pickBiome(temperature, moisture, elevated, ridge);
+            const terrain = biomeToTerrain(biome);
 
             return {
                 terrain: terrain,
@@ -435,67 +743,64 @@
             return getCachedTerrainInfo(x, y).terrain;
         }
 
-        function loadBiomeLookupTexture() {
-            const isDataUrlSource = BIOME_LOOKUP_IMAGE_URL.startsWith("data:");
-            if (window.location.protocol === "file:" && !isDataUrlSource) {
-                biomeLookupData = null; // keep fallback palette active when opened directly from disk
-                console.warn(
-                    "[biome-sample] Skipping biome lookup image on file:// due to browser CORS restrictions. " +
-                    "Run a local server (for example: python -m http.server 8000) and open http://localhost:8000/."
-                );
-                return;
-            }
-
-            const img = new Image();
-            img.crossOrigin = "anonymous";
-            img.onload = () => {
-                const sampleCanvas = document.createElement("canvas");
-                sampleCanvas.width = img.width;
-                sampleCanvas.height = img.height;
-                const sampleContext = sampleCanvas.getContext("2d");
-                sampleContext.drawImage(img, 0, 0);
-                const imageData = sampleContext.getImageData(0, 0, img.width, img.height);
-                biomeLookupData = imageData.data;
-                biomeLookupWidth = img.width;
-                biomeLookupHeight = img.height;
-                redraw(currentTransform);
-            };
-            img.onerror = () => {
-                biomeLookupData = null; // keep fallback palette active
-            };
-            img.src = BIOME_LOOKUP_IMAGE_URL;
+        function classifyTemperatureBand(temperature01) {
+            if (temperature01 < 0.33) return "cold";
+            if (temperature01 < 0.66) return "temperate";
+            return "hot";
         }
 
-        function elevationForTerrainColor(terrain, elevation) {
-            switch (terrain) {
-                case "ocean": return 0.06;
-                case "water": return 0.09;
-                case "beach": return 0.11;
-                case "plains": return 0.50;
-                case "grassland": return 0.56;
-                case "forest": return 0.62;
-                case "forest2": return 0.66;
-                case "mountain": return Math.max(0.72, elevation);
-                case "mountain2": return Math.max(0.80, elevation);
-                case "snow": return Math.max(0.92, elevation);
-                default: return elevation;
-            }
+        function classifyMoistureBand(moisture01) {
+            if (moisture01 < 0.33) return "dry";
+            if (moisture01 < 0.66) return "normal";
+            return "wet";
         }
 
-        function sampleBiomeLookupColor(terrain, moisture, elevation) {
-            if (!biomeLookupData || biomeLookupWidth <= 0 || biomeLookupHeight <= 0) {
+        function getTerrainTextureVariant(info) {
+            // Water/coast currently render with flat colors.
+            if (info.biome === "ocean" || info.biome === "shallow_water" || info.biome === "coast") {
                 return null;
             }
 
-            const mx = clamp01(moisture);
-            const ey = clamp01(elevationForTerrainColor(terrain, elevation));
-            const px = Math.max(0, Math.min(biomeLookupWidth - 1, Math.round(mx * (biomeLookupWidth - 1))));
-            const py = Math.max(0, Math.min(biomeLookupHeight - 1, Math.round((1 - ey) * (biomeLookupHeight - 1))));
-            const idx = ((py * biomeLookupWidth) + px) * 4;
-            const r = biomeLookupData[idx];
-            const g = biomeLookupData[idx + 1];
-            const b = biomeLookupData[idx + 2];
-            return `rgb(${r}, ${g}, ${b})`;
+            const temperatureBand = classifyTemperatureBand(info.temperature);
+            const moistureBand = classifyMoistureBand(info.moisture);
+            const textureBiome = info.biome === "mountaintop" ? "snow" : info.biome;
+            return `${textureBiome}_${temperatureBand}_${moistureBand}`;
+        }
+
+        function getTerrainPattern(info) {
+            if (!USE_TERRAIN_TEXTURES) {
+                return null;
+            }
+
+            const variant = getTerrainTextureVariant(info);
+            if (!variant) {
+                return null;
+            }
+            if (terrainPatternCache.has(variant)) {
+                return terrainPatternCache.get(variant);
+            }
+            const knownLoadState = terrainPatternLoadState.get(variant);
+            if (knownLoadState === "loading" || knownLoadState === "missing") {
+                return null;
+            }
+
+            terrainPatternLoadState.set(variant, "loading");
+            const img = new Image();
+            img.onload = () => {
+                const pattern = context.createPattern(img, "repeat");
+                if (pattern) {
+                    terrainPatternCache.set(variant, pattern);
+                    terrainPatternLoadState.set(variant, "ready");
+                    redraw(currentTransform);
+                } else {
+                    terrainPatternLoadState.set(variant, "missing");
+                }
+            };
+            img.onerror = () => {
+                terrainPatternLoadState.set(variant, "missing");
+            };
+            img.src = `${TERRAIN_TEXTURE_ROOT}/${variant}.png`;
+            return null;
         }
 
         // Function for turning a terrain tile into graphical output
@@ -503,37 +808,37 @@
         // Also, the coordinates are already transformed by the zoom level and translation.
         // Note that the tile may be partially visible, so you may need to draw a partial tile.
         function drawTile(info, x, y, size) {
+            // Snap to device pixels to prevent anti-aliased seams between adjacent tiles.
+            const x0 = Math.floor(x);
+            const y0 = Math.floor(y);
+            const x1 = Math.ceil(x + size);
+            const y1 = Math.ceil(y + size);
+            const drawW = Math.max(1, x1 - x0);
+            const drawH = Math.max(1, y1 - y0);
+
+            const pattern = getTerrainPattern(info);
+            if (pattern) {
+                context.fillStyle = pattern;
+                context.fillRect(x0, y0, drawW, drawH);
+                return;
+            }
+
             const terrain = info.terrain;
-            switch(terrain) {
+            switch (terrain) {
                 case "ocean":
-                    if (USE_RANDOM_WATER_COLOR) {
-                        context.fillStyle = `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`;
-                    } else if (USE_BIOME_LOOKUP_COLORS) {
-                        const sampledColor = sampleBiomeLookupColor(terrain, info.moisture, info.elevation);
-                        context.fillStyle = sampledColor || TERRAIN_COLORS.ocean;
-                    } else {
-                        context.fillStyle = TERRAIN_COLORS.ocean;
-                    }
+                    context.fillStyle = USE_RANDOM_WATER_COLOR
+                        ? `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`
+                        : TERRAIN_COLORS.ocean;
                     break;
                 case "water":
-                    if (USE_RANDOM_WATER_COLOR) {
-                        context.fillStyle = `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`;
-                    } else if (USE_BIOME_LOOKUP_COLORS) {
-                        const sampledColor = sampleBiomeLookupColor(terrain, info.moisture, info.elevation);
-                        context.fillStyle = sampledColor || TERRAIN_COLORS.water;
-                    } else {
-                        context.fillStyle = TERRAIN_COLORS.water;
-                    }
+                    context.fillStyle = USE_RANDOM_WATER_COLOR
+                        ? `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`
+                        : TERRAIN_COLORS.water;
                     break;
                 default:
-                    if (USE_BIOME_LOOKUP_COLORS) {
-                        const sampledColor = sampleBiomeLookupColor(terrain, info.moisture, info.elevation);
-                        context.fillStyle = sampledColor || TERRAIN_COLORS[terrain];
-                    } else {
-                        context.fillStyle = TERRAIN_COLORS[terrain];
-                    }
-                }
-            context.fillRect(x, y, size, size);
+                    context.fillStyle = TERRAIN_COLORS[terrain] || "#ff00ff";
+            }
+            context.fillRect(x0, y0, drawW, drawH);
         }
 
         // Compute visible world tile range directly from transform (no player-position projection).
@@ -609,6 +914,7 @@
         canvas.height = window.innerHeight;
         document.body.appendChild(canvas);
         const context = canvas.getContext("2d");
+        context.imageSmoothingEnabled = false;
         const tooltip = d3.select("body")
             .append("div")
             .attr("class", "tooltip");
@@ -679,8 +985,6 @@
                 islandLabel.text(`Island Shape: ${value}%`);
                 redraw(currentTransform);
             });
-        loadBiomeLookupTexture();
-
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Create the event listeners for resize, zoom, and keydown/keyup on the canvas and the window
         ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
