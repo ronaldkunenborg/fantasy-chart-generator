@@ -65,6 +65,8 @@
         const TERRAIN_COLORS = {
             ocean: "#37498b",
             water: "#6b81da",
+            ocean_ice: "#b9c9e3",
+            water_ice: "#d4e3f2",
             beach: "#cfcb89",
             desert: "#cfcb89",
             shrubland: "#a7c576",
@@ -83,6 +85,11 @@
             mountain2: "#d0d1c4",
             snow: "#ffffff"
         };
+        const OCEAN_ICE_TEMPERATURE_START = 0.18;
+        const OCEAN_ICE_TEMPERATURE_END = 0.30;
+        const WATER_ICE_TEMPERATURE_START = 0.22;
+        const WATER_ICE_TEMPERATURE_END = 0.34;
+        const ICE_TRANSITION_NOISE_STRENGTH = 0.08;
 
         // World terrain/biome reference ranges for later biome correlation work.
         // Temperature + precipitation values are based on NASA "Mission: Biomes":
@@ -132,7 +139,10 @@
             waterBaseEdge: 0.40,
             waterBaseCore: 0.26,
             waterBlendStrength: 0.32,
-            lowlandSinkStrength: 0.16
+            lowlandSinkStrength: 0.16,
+            coastalSinkStart: 0.68,
+            coastalSinkStrength: 0.26,
+            coastalMountainSuppressionStart: 0.72
         };
 
         const terrainCache = new Map();
@@ -158,6 +168,26 @@
         function smoothstep(edge0, edge1, x) {
             const t = clamp01((x - edge0) / (edge1 - edge0));
             return t * t * (3 - 2 * t);
+        }
+
+        function hexToRgb(hex) {
+            const h = hex.replace("#", "");
+            const value = parseInt(h, 16);
+            return {
+                r: (value >> 16) & 255,
+                g: (value >> 8) & 255,
+                b: value & 255
+            };
+        }
+
+        function mixHexColors(hexA, hexB, t) {
+            const a = hexToRgb(hexA);
+            const b = hexToRgb(hexB);
+            const u = clamp01(t);
+            const r = Math.round(a.r + ((b.r - a.r) * u));
+            const g = Math.round(a.g + ((b.g - a.g) * u));
+            const bb = Math.round(a.b + ((b.b - a.b) * u));
+            return `rgb(${r}, ${g}, ${bb})`;
         }
 
         function fbmNoise2(x, y, zoom, offsetX, offsetY) {
@@ -237,6 +267,8 @@
                     moisture: 0,
                     temperature: 0,
                     ridge: 0,
+                    oceanIceFactor: 0,
+                    waterIceFactor: 0,
                     zone: "outside"
                 };
             }
@@ -281,11 +313,13 @@
                 centerDistance + ((coastNoise - 0.5) * islandJitterValue)
             );
 
-            // [Item 5] Blend in an island target (1 - distance), so elevation drops toward edges naturally.
+            // [Item 5] Blend in an island target (1 - distance), but only as a lowering pass.
+            // This keeps edge-water shaping while avoiding aggressive center uplift.
             const islandTargetElevation = 1 - centerDistance;
+            const islandLoweredElevation = Math.min(elevation, islandTargetElevation);
             elevation = clamp01(
                 (elevation * (1 - islandMixValue)) +
-                (islandTargetElevation * islandMixValue)
+                (islandLoweredElevation * islandMixValue)
             );
 
             // [Item 6] Regional mountain/water shaping on top of island-form elevation.
@@ -315,7 +349,14 @@
                 TERRAIN_MODEL.mountainBaseEdge +
                 (TERRAIN_MODEL.mountainBaseCore - TERRAIN_MODEL.mountainBaseEdge) * mountainProfile;
             const mountainStrength = 0.2 + (mountainMultiplier * 1.6); // 0..100% maps to 0.2..1.8, 50% ~= baseline
-            const mountainBlend = clamp01(mountainRegion * TERRAIN_MODEL.mountainBlendStrength * mountainStrength);
+            const mountainEdgeGate = 1 - smoothstep(
+                TERRAIN_MODEL.coastalMountainSuppressionStart,
+                1,
+                centerDistance
+            );
+            const mountainBlend = clamp01(
+                mountainRegion * TERRAIN_MODEL.mountainBlendStrength * mountainStrength * mountainEdgeGate
+            );
             elevation = clamp01((elevation * (1 - mountainBlend)) + (mountainBaseline * mountainBlend));
 
             // Use inverse mountainness to carve coherent lowland/water basins.
@@ -336,11 +377,32 @@
 
             elevation = clamp01(elevation - (lowlandDepth * TERRAIN_MODEL.lowlandSinkStrength * (1 - mountainRegion)));
 
+            // Final coastline sink to ensure stronger rolloff near map boundaries.
+            const coastalSink = smoothstep(TERRAIN_MODEL.coastalSinkStart, 1, centerDistance);
+            const coastalSinkScale = 0.35 + (islandShapeMultiplier * 1.25);
+            elevation = clamp01(elevation - (coastalSink * TERRAIN_MODEL.coastalSinkStrength * coastalSinkScale));
+
             // [Change 6] Temperature proxy: latitude + elevation cooling.
             const lat01 = (y - MAP_Y_MIN) / (MAP_Y_MAX - MAP_Y_MIN); // 0 north .. 1 south
             const equatorDistance = Math.abs(lat01 - 0.5) * 2; // 0 equator .. 1 poles
             const baseTemperature = 1 - (equatorDistance * 0.85);
             const temperature = clamp01(baseTemperature - (elevation * 0.45));
+            const iceTransitionNoise = normalizeNoise(
+                fbmNoise2(x, y, NOISE_ZOOM * 18, TERRAIN_MODEL.coastOffsetX + 9503, TERRAIN_MODEL.coastOffsetY - 4711)
+            );
+            const localIceTemp = clamp01(
+                temperature + ((iceTransitionNoise - 0.5) * ICE_TRANSITION_NOISE_STRENGTH)
+            );
+            const oceanIceFactor = 1 - smoothstep(
+                OCEAN_ICE_TEMPERATURE_START,
+                OCEAN_ICE_TEMPERATURE_END,
+                localIceTemp
+            );
+            const waterIceFactor = 1 - smoothstep(
+                WATER_ICE_TEMPERATURE_START,
+                WATER_ICE_TEMPERATURE_END,
+                localIceTemp
+            );
 
             // [Change 7] Coast and mountain refinement with separate ridge signal.
             const ridge = ridgedNoise2(x, y, NOISE_ZOOM * 0.9, TERRAIN_MODEL.ridgeOffsetX, TERRAIN_MODEL.ridgeOffsetY);
@@ -349,13 +411,43 @@
 
             // Water/coast bands first
             if (elevated < 0.08) {
-                return { terrain: "ocean", biome: "ocean", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
+                return {
+                    terrain: "ocean",
+                    biome: "ocean",
+                    elevation: elevated,
+                    moisture: moisture,
+                    temperature: temperature,
+                    ridge: ridge,
+                    oceanIceFactor: oceanIceFactor,
+                    waterIceFactor: waterIceFactor,
+                    zone: "inland"
+                };
             }
             if (elevated < 0.10) {
-                return { terrain: "water", biome: "shallow_water", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
+                return {
+                    terrain: "water",
+                    biome: "shallow_water",
+                    elevation: elevated,
+                    moisture: moisture,
+                    temperature: temperature,
+                    ridge: ridge,
+                    oceanIceFactor: oceanIceFactor,
+                    waterIceFactor: waterIceFactor,
+                    zone: "inland"
+                };
             }
             if (elevated < 0.12) {
-                return { terrain: "beach", biome: "coast", elevation: elevated, moisture: moisture, temperature: temperature, ridge: ridge, zone: "inland" };
+                return {
+                    terrain: "beach",
+                    biome: "coast",
+                    elevation: elevated,
+                    moisture: moisture,
+                    temperature: temperature,
+                    ridge: ridge,
+                    oceanIceFactor: oceanIceFactor,
+                    waterIceFactor: waterIceFactor,
+                    zone: "inland"
+                };
             }
 
             // Biome selection after ridge application, based on final elevation.
@@ -369,6 +461,8 @@
                 moisture: moisture,
                 temperature: temperature,
                 ridge: ridge,
+                oceanIceFactor: oceanIceFactor,
+                waterIceFactor: waterIceFactor,
                 zone: "inland"
             };
         }
@@ -477,14 +571,22 @@
             const terrain = info.terrain;
             switch (terrain) {
                 case "ocean":
-                    context.fillStyle = USE_RANDOM_WATER_COLOR
-                        ? `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`
-                        : TERRAIN_COLORS.ocean;
+                    if (info.oceanIceFactor > 0.01) {
+                        context.fillStyle = mixHexColors(TERRAIN_COLORS.ocean, TERRAIN_COLORS.ocean_ice, info.oceanIceFactor);
+                    } else {
+                        context.fillStyle = USE_RANDOM_WATER_COLOR
+                            ? `rgba(30, 125, ${Math.floor(128 + Math.random() * 72)}, 1)`
+                            : TERRAIN_COLORS.ocean;
+                    }
                     break;
                 case "water":
-                    context.fillStyle = USE_RANDOM_WATER_COLOR
-                        ? `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`
-                        : TERRAIN_COLORS.water;
+                    if (info.waterIceFactor > 0.01) {
+                        context.fillStyle = mixHexColors(TERRAIN_COLORS.water, TERRAIN_COLORS.water_ice, info.waterIceFactor);
+                    } else {
+                        context.fillStyle = USE_RANDOM_WATER_COLOR
+                            ? `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`
+                            : TERRAIN_COLORS.water;
+                    }
                     break;
                 default:
                     context.fillStyle = TERRAIN_COLORS[terrain] || "#ff00ff";
@@ -712,16 +814,60 @@
             (canvas.height / 2) - (PLAYER_STARTING_POSITION_Y * TILE_SIZE)
         );
 
+        function clampCameraTransform(transform) {
+            const k = transform.k;
+            const tilePx = TILE_SIZE * k;
+            const worldMinX = MAP_X_MIN * tilePx;
+            const worldMaxX = (MAP_X_MAX + 1) * tilePx;
+            const worldMinY = MAP_Y_MIN * tilePx;
+            const worldMaxY = (MAP_Y_MAX + 1) * tilePx;
+
+            const minTranslateX = canvas.width - worldMaxX;
+            const maxTranslateX = -worldMinX;
+            const minTranslateY = canvas.height - worldMaxY;
+            const maxTranslateY = -worldMinY;
+
+            let clampedX;
+            let clampedY;
+            if (minTranslateX > maxTranslateX) {
+                clampedX = (minTranslateX + maxTranslateX) * 0.5;
+            } else {
+                clampedX = Math.max(minTranslateX, Math.min(maxTranslateX, transform.x));
+            }
+            if (minTranslateY > maxTranslateY) {
+                clampedY = (minTranslateY + maxTranslateY) * 0.5;
+            } else {
+                clampedY = Math.max(minTranslateY, Math.min(maxTranslateY, transform.y));
+            }
+
+            return d3.zoomIdentity.translate(clampedX, clampedY).scale(k);
+        }
+
+        function applyTransform(nextTransform) {
+            currentTransform = clampCameraTransform(nextTransform);
+            d3.select(canvas).call(zoomBehavior.transform, currentTransform);
+        }
+
         // Keep zoom behavior simple like d3-fantasychart3:
         // let D3 manage wheel zoom focus natively (world point under cursor stays fixed).
         const zoomBehavior = d3.zoom()
             .scaleExtent([1, 8])
             .on("zoom", (event) => {
-                currentTransform = event.transform;
+                const clamped = clampCameraTransform(event.transform);
+                const changed =
+                    Math.abs(clamped.x - event.transform.x) > 0.001 ||
+                    Math.abs(clamped.y - event.transform.y) > 0.001 ||
+                    Math.abs(clamped.k - event.transform.k) > 0.001;
+                if (changed) {
+                    d3.select(canvas).call(zoomBehavior.transform, clamped);
+                    return;
+                }
+                currentTransform = clamped;
                 redraw(currentTransform);
             });
 
         // Apply the behavior and synchronize the initial transform state.
+        currentTransform = clampCameraTransform(currentTransform);
         d3.select(canvas).call(zoomBehavior).call(zoomBehavior.transform, currentTransform);
 
         // Add a resize listener. This will redraw the tiles when the window is resized.
@@ -744,8 +890,7 @@
 
                 // Reapply the old currentTransform after resizing
                 // This prevents the map from jumping around when resizing
-                d3.select(canvas).call(zoomBehavior.transform, currentTransform);
-                redraw(currentTransform);
+                applyTransform(currentTransform);
             }, 100); // Stel de debounce-tijd in (bijvoorbeeld 100 ms)
         });
 
@@ -816,7 +961,7 @@
             }
 
             if (moved) {
-                d3.select(canvas).call(zoomBehavior.transform, currentTransform);
+                applyTransform(currentTransform);
             }
         }
 
