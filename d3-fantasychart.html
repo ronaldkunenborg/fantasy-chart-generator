@@ -120,6 +120,21 @@
         const RIVER_LINE_WIDTH_FACTOR = 0.22;
         const RIVER_COLOR = "#2f66c7";
         const RIVER_ICE_COLOR = "#dce9fb";
+        const ENABLE_OCEAN_MOUNTAIN_PATH_PREVIEW = true;
+        const OCEAN_MOUNTAIN_PATH_COUNT = 28;
+        const OCEAN_MOUNTAIN_CANDIDATE_SAMPLE_STEP = 24;
+        const OCEAN_MOUNTAIN_MIN_CANDIDATE_ELEVATION = 0.74;
+        const OCEAN_MOUNTAIN_MIN_PEAK_SPACING = 120;
+        const OCEAN_MOUNTAIN_MAX_OCEAN_SEARCH_RADIUS = 520;
+        const OCEAN_MOUNTAIN_PATH_MAX_STEPS = 3200;
+        const OCEAN_MOUNTAIN_FALLBACK_MAX_NODES = 24000;
+        const PATH_MEANDER_NOISE_STRENGTH = 0.65;
+        const PATH_STRAIGHT_PENALTY = 0.28;
+        const PATH_UPHILL_PENALTY = 24.0;
+        const PATH_DOWNHILL_BONUS = 6.0;
+        const PATH_TARGET_PULL = 0.045;
+        const PATH_AWAY_TARGET_PENALTY = 1.15;
+        const PATH_PREVIEW_COLOR = "rgba(44, 130, 240, 0.86)";
 
         // World terrain/biome reference ranges for later biome correlation work.
         // Temperature + precipitation values are based on NASA "Mission: Biomes":
@@ -182,6 +197,10 @@
         const riverFlowDirectionCache = new Map();
         const riverFlowAccumulationCache = new Map();
         const riverTileActiveCache = new Map();
+        const pathPreviewTileCache = new Set();
+        const pathPreviewOceanReplacementTileCache = new Set();
+        let pathPreviewDirty = true;
+        let pathPreviewGeneratedCount = 0;
         let terrainLayerCanvas = null;
         let terrainLayerContext = null;
         const cloudSprites = [];
@@ -277,6 +296,257 @@
             riverFlowDirectionCache.clear();
             riverFlowAccumulationCache.clear();
             riverTileActiveCache.clear();
+            pathPreviewTileCache.clear();
+            pathPreviewOceanReplacementTileCache.clear();
+            pathPreviewDirty = true;
+            pathPreviewGeneratedCount = 0;
+        }
+
+        function isPathPreviewWaterTile(info) {
+            return (
+                info.zone === "outside" ||
+                info.biome === "ocean" ||
+                info.biome === "shallow_water" ||
+                info.biome === "coast"
+            );
+        }
+
+        function isPathPreviewOceanDestinationTile(info) {
+            return info.zone === "outside";
+        }
+
+        function getNearestMapEdgePoint(x, y) {
+            const topDistance = Math.abs(y - MAP_Y_MIN);
+            const bottomDistance = Math.abs(MAP_Y_MAX - y);
+            const leftDistance = Math.abs(x - MAP_X_MIN);
+            const rightDistance = Math.abs(MAP_X_MAX - x);
+            const minDistance = Math.min(topDistance, bottomDistance, leftDistance, rightDistance);
+            if (minDistance === topDistance) {
+                return { x: x, y: MAP_Y_MIN };
+            }
+            if (minDistance === bottomDistance) {
+                return { x: x, y: MAP_Y_MAX };
+            }
+            if (minDistance === leftDistance) {
+                return { x: MAP_X_MIN, y: y };
+            }
+            return { x: MAP_X_MAX, y: y };
+        }
+
+        function isPathPreviewMountainCandidate(info) {
+            if (info.zone !== "inland") {
+                return false;
+            }
+            const mountainLike =
+                info.biome === "mountaintop" ||
+                info.biome === "alpine" ||
+                info.biome === "alpine_tundra" ||
+                info.biome === "mountain";
+            return mountainLike && info.elevation >= OCEAN_MOUNTAIN_MIN_CANDIDATE_ELEVATION;
+        }
+
+        function isPathPreviewLandTile(info) {
+            return (
+                info.zone === "inland" &&
+                info.biome !== "ocean" &&
+                info.biome !== "shallow_water" &&
+                info.biome !== "coast"
+            );
+        }
+
+        function traceLineToEdge(startX, startY, targetX, targetY) {
+            const path = [];
+            let x0 = startX;
+            let y0 = startY;
+            const x1 = targetX;
+            const y1 = targetY;
+            const dx = Math.abs(x1 - x0);
+            const sx = x0 < x1 ? 1 : -1;
+            const dy = -Math.abs(y1 - y0);
+            const sy = y0 < y1 ? 1 : -1;
+            let err = dx + dy;
+            let steps = 0;
+
+            while (steps < OCEAN_MOUNTAIN_PATH_MAX_STEPS) {
+                if (x0 < MAP_X_MIN || x0 > MAP_X_MAX || y0 < MAP_Y_MIN || y0 > MAP_Y_MAX) {
+                    break;
+                }
+                path.push({ x: x0, y: y0 });
+                if (x0 === x1 && y0 === y1) {
+                    break;
+                }
+                const e2 = err * 2;
+                if (e2 >= dy) {
+                    err += dy;
+                    x0 += sx;
+                }
+                if (e2 <= dx) {
+                    err += dx;
+                    y0 += sy;
+                }
+                steps += 1;
+            }
+            return path;
+        }
+
+        function traceMeanderingDownhillToEdge(startX, startY, targetX, targetY) {
+            const path = [];
+            const visited = new Set();
+            let x = startX;
+            let y = startY;
+            let previousDirection = null;
+
+            for (let step = 0; step < OCEAN_MOUNTAIN_PATH_MAX_STEPS; step += 1) {
+                const key = `${x},${y}`;
+                if (visited.has(key)) {
+                    break;
+                }
+                visited.add(key);
+                path.push({ x: x, y: y });
+
+                if (x === targetX && y === targetY) {
+                    return path;
+                }
+
+                const currentInfo = getCachedTerrainInfo(x, y);
+                const currentTargetDistance = Math.hypot(targetX - x, targetY - y);
+                let bestDirection = null;
+                let bestScore = Number.POSITIVE_INFINITY;
+
+                for (const direction of FLOW_DIRECTIONS) {
+                    const nx = x + direction.dx;
+                    const ny = y + direction.dy;
+                    if (nx < MAP_X_MIN || nx > MAP_X_MAX || ny < MAP_Y_MIN || ny > MAP_Y_MAX) {
+                        continue;
+                    }
+
+                    const neighborKey = `${nx},${ny}`;
+                    const neighborInfo = getCachedTerrainInfo(nx, ny);
+                    const targetDistance = Math.hypot(targetX - nx, targetY - ny);
+                    const drop = currentInfo.elevation - neighborInfo.elevation;
+                    const uphill = Math.max(0, -drop);
+                    const downhill = Math.max(0, drop);
+                    const awayDistance = Math.max(0, targetDistance - currentTargetDistance);
+                    const revisitPenalty = visited.has(neighborKey) ? 2000 : 0;
+                    const straightPenalty =
+                        previousDirection && previousDirection.bit === direction.bit ? PATH_STRAIGHT_PENALTY : 0;
+                    const reversePenalty =
+                        previousDirection && previousDirection.oppositeBit === direction.bit ? 400 : 0;
+                    const meanderNoise =
+                        (normalizeNoise(
+                            fbmNoise2(
+                                nx,
+                                ny,
+                                28,
+                                TERRAIN_MODEL.coastOffsetX + 7511,
+                                TERRAIN_MODEL.coastOffsetY - 3617
+                            )
+                        ) - 0.5) * PATH_MEANDER_NOISE_STRENGTH;
+
+                    const score =
+                        (targetDistance * PATH_TARGET_PULL) +
+                        (awayDistance * PATH_AWAY_TARGET_PENALTY) +
+                        (uphill * PATH_UPHILL_PENALTY) -
+                        (downhill * PATH_DOWNHILL_BONUS) +
+                        straightPenalty +
+                        reversePenalty +
+                        revisitPenalty +
+                        meanderNoise;
+
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestDirection = direction;
+                    }
+                }
+
+                if (!bestDirection) {
+                    break;
+                }
+
+                x += bestDirection.dx;
+                y += bestDirection.dy;
+                previousDirection = bestDirection;
+            }
+
+            if (path.length > 0) {
+                const tail = path[path.length - 1];
+                if (tail.x !== targetX || tail.y !== targetY) {
+                    const tailConnector = traceLineToEdge(tail.x, tail.y, targetX, targetY);
+                    if (tailConnector.length > 1) {
+                        return path.concat(tailConnector.slice(1));
+                    }
+                }
+            }
+            return path;
+        }
+
+        function ensurePathPreviewTiles() {
+            if (!ENABLE_OCEAN_MOUNTAIN_PATH_PREVIEW || !pathPreviewDirty) {
+                return;
+            }
+
+            pathPreviewTileCache.clear();
+            pathPreviewOceanReplacementTileCache.clear();
+            pathPreviewGeneratedCount = 0;
+            const candidates = [];
+            for (let x = MAP_X_MIN; x <= MAP_X_MAX; x += OCEAN_MOUNTAIN_CANDIDATE_SAMPLE_STEP) {
+                for (let y = MAP_Y_MIN; y <= MAP_Y_MAX; y += OCEAN_MOUNTAIN_CANDIDATE_SAMPLE_STEP) {
+                    const info = getCachedTerrainInfo(x, y);
+                    if (!isPathPreviewMountainCandidate(info)) {
+                        continue;
+                    }
+                    candidates.push({
+                        x: x,
+                        y: y,
+                        elevation: info.elevation
+                    });
+                }
+            }
+            candidates.sort((a, b) => b.elevation - a.elevation);
+
+            const selectedPeaks = [];
+            for (const candidate of candidates) {
+                if (selectedPeaks.length >= OCEAN_MOUNTAIN_PATH_COUNT) {
+                    break;
+                }
+                let tooClose = false;
+                for (const peak of selectedPeaks) {
+                    if (Math.hypot(peak.x - candidate.x, peak.y - candidate.y) < OCEAN_MOUNTAIN_MIN_PEAK_SPACING) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                if (tooClose) {
+                    continue;
+                }
+                selectedPeaks.push(candidate);
+            }
+
+            for (const peak of selectedPeaks) {
+                const edgeTarget = getNearestMapEdgePoint(peak.x, peak.y);
+                const path = traceMeanderingDownhillToEdge(peak.x, peak.y, edgeTarget.x, edgeTarget.y);
+                if (path.length === 0) {
+                    continue;
+                }
+
+                for (const tile of path) {
+                    pathPreviewTileCache.add(`${tile.x},${tile.y}`);
+                }
+                // Ocean replacement pass from map-edge endpoint inward:
+                // convert contiguous non-land path tiles to ocean-style tiles,
+                // stop once we hit the first true land tile.
+                for (let i = path.length - 1; i >= 0; i -= 1) {
+                    const tile = path[i];
+                    const info = getCachedTerrainInfo(tile.x, tile.y);
+                    if (isPathPreviewLandTile(info)) {
+                        break;
+                    }
+                    pathPreviewOceanReplacementTileCache.add(`${tile.x},${tile.y}`);
+                }
+                pathPreviewGeneratedCount += 1;
+            }
+
+            pathPreviewDirty = false;
         }
 
         function isRiverLandTile(info) {
@@ -1017,6 +1287,35 @@
             }
         }
 
+        function drawPathPreviewOverlay(tileX, tileY, x0, y0, drawW, drawH, targetContext) {
+            if (!ENABLE_OCEAN_MOUNTAIN_PATH_PREVIEW) {
+                return;
+            }
+            if (pathPreviewOceanReplacementTileCache.has(`${tileX},${tileY}`)) {
+                return;
+            }
+            if (!pathPreviewTileCache.has(`${tileX},${tileY}`)) {
+                return;
+            }
+            targetContext.fillStyle = PATH_PREVIEW_COLOR;
+            targetContext.fillRect(x0, y0, drawW, drawH);
+        }
+
+        function drawPathOceanReplacementOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext) {
+            if (!ENABLE_OCEAN_MOUNTAIN_PATH_PREVIEW) {
+                return;
+            }
+            if (!pathPreviewOceanReplacementTileCache.has(`${tileX},${tileY}`)) {
+                return;
+            }
+            if (useIceColorBlending && info.oceanIceFactor > 0.01) {
+                targetContext.fillStyle = mixHexColors(TERRAIN_COLORS.ocean, TERRAIN_COLORS.ocean_ice, info.oceanIceFactor);
+            } else {
+                targetContext.fillStyle = TERRAIN_COLORS.ocean;
+            }
+            targetContext.fillRect(x0, y0, drawW, drawH);
+        }
+
         function drawTile(info, x, y, size, targetContext = context, tileX = null, tileY = null) {
             // Snap to device pixels to prevent anti-aliased seams between adjacent tiles.
             const x0 = Math.floor(x);
@@ -1025,16 +1324,15 @@
             const y1 = Math.ceil(y + size);
             const drawW = Math.max(1, x1 - x0);
             const drawH = Math.max(1, y1 - y0);
-            if (tileX !== null && tileY !== null) {
-                ensureRiverInfo(tileX, tileY, info);
-            }
-
             // Below 3 px, textures lose detail and cost more than they add; use flat color fallback.
             const pattern = (size >= MIN_TEXTURE_TILE_PIXEL_SIZE) ? getTerrainPattern(info, targetContext) : null;
             if (pattern) {
                 targetContext.fillStyle = pattern;
                 targetContext.fillRect(x0, y0, drawW, drawH);
-                drawRiverOverlay(info, x0, y0, drawW, drawH, size, targetContext);
+                if (tileX !== null && tileY !== null) {
+                    drawPathOceanReplacementOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext);
+                    drawPathPreviewOverlay(tileX, tileY, x0, y0, drawW, drawH, targetContext);
+                }
                 return;
             }
 
@@ -1062,7 +1360,10 @@
                     targetContext.fillStyle = TERRAIN_COLORS[terrain] || "#ff00ff";
             }
             targetContext.fillRect(x0, y0, drawW, drawH);
-            drawRiverOverlay(info, x0, y0, drawW, drawH, size, targetContext);
+            if (tileX !== null && tileY !== null) {
+                drawPathOceanReplacementOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext);
+                drawPathPreviewOverlay(tileX, tileY, x0, y0, drawW, drawH, targetContext);
+            }
         }
 
         // Compute visible world tile range directly from transform (no player-position projection).
@@ -1185,6 +1486,7 @@
             if (!terrainLayerCanvas || !terrainLayerContext) {
                 return;
             }
+            ensurePathPreviewTiles();
 
             terrainLayerContext.clearRect(0, 0, terrainLayerCanvas.width, terrainLayerCanvas.height);
 
@@ -1547,7 +1849,9 @@
             const tileX = Math.floor((mouseX - currentTransform.x) / tilePx);
             const tileY = Math.floor((mouseY - currentTransform.y) / tilePx);
             const info = getCachedTerrainInfo(tileX, tileY);
-            ensureRiverInfo(tileX, tileY, info);
+            ensurePathPreviewTiles();
+            const isPathTile = pathPreviewTileCache.has(`${tileX},${tileY}`);
+            const isOceanReplacedPathTile = pathPreviewOceanReplacementTileCache.has(`${tileX},${tileY}`);
             const color = TERRAIN_COLORS[info.terrain] || "n/a";
 
             tooltip
@@ -1562,13 +1866,9 @@
                     `Moisture: ${info.moisture.toFixed(3)}<br>` +
                     `Temp: ${info.temperature.toFixed(3)}<br>` +
                     `Ridge: ${info.ridge.toFixed(3)}<br>` +
-                    `River: ${info.hasRiver ? "yes" : "no"}<br>` +
-                    `River Mask: ${info.riverDirectionMask}<br>` +
-                    `River Orientation: ${info.riverOrientation}<br>` +
-                    `River Flow: ${(info.riverFlowWeight || 0).toFixed(2)}<br>` +
-                    `River Thickness: ${(info.riverThickness || 0).toFixed(2)}<br>` +
-                    `River Basin: ${info.riverHasLakeBasin ? "yes" : "no"}<br>` +
-                    `River Delta: ${info.riverDeltaCandidate ? "yes" : "no"}<br>` +
+                    `Path Tile: ${isPathTile ? "yes" : "no"}<br>` +
+                    `Path Ocean Tile: ${isOceanReplacedPathTile ? "yes" : "no"}<br>` +
+                    `Generated Paths: ${pathPreviewGeneratedCount}<br>` +
                     `Zoom: ${currentTransform.k.toFixed(2)}`
                 );
         });

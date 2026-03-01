@@ -6,6 +6,8 @@
 - Per tile there should be only one river path, connecting downstream until sea or a local uphill-locked basin.
 - River metadata should include flow weight/thickness based on tributary joins and downhill water volume.
 - River generation should start from eligible mountain headwaters and follow downhill paths toward sea or inland basins.
+- In path preview mode, render a configurable number of blue tile paths from ocean/coast tiles to nearby mountain tops, and recalculate when mountain shaping changes.
+- Alternate path preview mode: pick highest mountain spots and draw blue traced lines from each peak to the nearest map edge, continuing to the map boundary regardless of water/terrain.
 
 ## Git commit message format
 - Always use real newlines in commit bodies.
