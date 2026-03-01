@@ -105,6 +105,21 @@
         const WATER_ICE_TEMPERATURE_START = 0.22;
         const WATER_ICE_TEMPERATURE_END = 0.34;
         const ICE_TRANSITION_NOISE_STRENGTH = 0.08;
+        const ENABLE_RIVER_OVERLAY = true;
+        const RIVER_MIN_FLOW_DROP = 0.001;
+        const RIVER_SOURCE_MIN_MOISTURE = 0.34;
+        const RIVER_SOURCE_MIN_ELEVATION = 0.54;
+        const RIVER_SOURCE_MAX_ELEVATION = 0.96;
+        const RIVER_SOURCE_MIN_RIDGE = 0.45;
+        const RIVER_SOURCE_MIN_GLACIER = 0.08;
+        const RIVER_LAKE_SPILL_MAX_RISE = 0.002;
+        const RIVER_FLOW_ATTENUATION = 1.0;
+        const RIVER_MIN_VISIBLE_FLOW = 0.9;
+        const RIVER_DELTA_FLOW_THRESHOLD = 7.5;
+        const RIVER_MIN_DRAW_PIXEL_SIZE = 2;
+        const RIVER_LINE_WIDTH_FACTOR = 0.22;
+        const RIVER_COLOR = "#2f66c7";
+        const RIVER_ICE_COLOR = "#dce9fb";
 
         // World terrain/biome reference ranges for later biome correlation work.
         // Temperature + precipitation values are based on NASA "Mission: Biomes":
@@ -163,10 +178,33 @@
         const terrainCache = new Map();
         const terrainPatternCache = new Map();
         const terrainPatternLoadState = new Map();
+        const riverSourceCache = new Map();
+        const riverFlowDirectionCache = new Map();
+        const riverFlowAccumulationCache = new Map();
+        const riverTileActiveCache = new Map();
         let terrainLayerCanvas = null;
         let terrainLayerContext = null;
         const cloudSprites = [];
         let renderMsEma = 0;
+
+        const RIVER_DIR_NORTH = 1;
+        const RIVER_DIR_EAST = 2;
+        const RIVER_DIR_SOUTH = 4;
+        const RIVER_DIR_WEST = 8;
+        const RIVER_DIR_NORTHEAST = 16;
+        const RIVER_DIR_SOUTHEAST = 32;
+        const RIVER_DIR_SOUTHWEST = 64;
+        const RIVER_DIR_NORTHWEST = 128;
+        const FLOW_DIRECTIONS = [
+            { dx: 0, dy: -1, bit: RIVER_DIR_NORTH, oppositeBit: RIVER_DIR_SOUTH, length: 1 },
+            { dx: 1, dy: 0, bit: RIVER_DIR_EAST, oppositeBit: RIVER_DIR_WEST, length: 1 },
+            { dx: 0, dy: 1, bit: RIVER_DIR_SOUTH, oppositeBit: RIVER_DIR_NORTH, length: 1 },
+            { dx: -1, dy: 0, bit: RIVER_DIR_WEST, oppositeBit: RIVER_DIR_EAST, length: 1 },
+            { dx: 1, dy: -1, bit: RIVER_DIR_NORTHEAST, oppositeBit: RIVER_DIR_SOUTHWEST, length: Math.SQRT2 },
+            { dx: 1, dy: 1, bit: RIVER_DIR_SOUTHEAST, oppositeBit: RIVER_DIR_NORTHWEST, length: Math.SQRT2 },
+            { dx: -1, dy: 1, bit: RIVER_DIR_SOUTHWEST, oppositeBit: RIVER_DIR_NORTHEAST, length: Math.SQRT2 },
+            { dx: -1, dy: -1, bit: RIVER_DIR_NORTHWEST, oppositeBit: RIVER_DIR_SOUTHEAST, length: Math.SQRT2 }
+        ];
 
         //////////////////////////////////////////////////////////////////////////////////////////////////////////////////// 
         // Functions
@@ -233,6 +271,276 @@
             return 1.0 - Math.abs(n); // [0..1] with sharp ridges near 1
         }
 
+        function clearTerrainDerivedCaches() {
+            terrainCache.clear();
+            riverSourceCache.clear();
+            riverFlowDirectionCache.clear();
+            riverFlowAccumulationCache.clear();
+            riverTileActiveCache.clear();
+        }
+
+        function isRiverLandTile(info) {
+            return (
+                info.zone === "inland" &&
+                info.biome !== "ocean" &&
+                info.biome !== "shallow_water" &&
+                info.biome !== "coast"
+            );
+        }
+
+        function getRiverOrientationFromMask(mask) {
+            if (mask === 0) return "none";
+            return `mask-${mask}`;
+        }
+
+        function hasLocalRiverSourcePotential(x, y, info) {
+            if (!ENABLE_RIVER_OVERLAY || !isRiverLandTile(info)) {
+                return false;
+            }
+            if (info.moisture < RIVER_SOURCE_MIN_MOISTURE) {
+                return false;
+            }
+            if (info.elevation < RIVER_SOURCE_MIN_ELEVATION || info.elevation > RIVER_SOURCE_MAX_ELEVATION) {
+                return false;
+            }
+            const isMountainBiome =
+                info.biome === "mountain" ||
+                info.biome === "alpine" ||
+                info.biome === "alpine_tundra" ||
+                info.biome === "mountaintop";
+            if (!isMountainBiome) {
+                return false;
+            }
+            if (info.ridge < RIVER_SOURCE_MIN_RIDGE) {
+                return false;
+            }
+
+            const sourceKey = `${x},${y}`;
+            if (riverSourceCache.has(sourceKey)) {
+                return riverSourceCache.get(sourceKey);
+            }
+            const glacierFactor = Math.max(
+                info.waterIceFactor || 0,
+                clamp01((0.42 - info.temperature) / 0.42)
+            );
+            // Any sufficiently moist/elevated mountain tile is a headwater source.
+            // Glacier/cold conditions increase source weight, but do not fully gate source creation.
+            const hasSource = true;
+            riverSourceCache.set(sourceKey, hasSource);
+            return hasSource;
+        }
+
+        function getRiverSourceWeight(x, y, info) {
+            if (!hasLocalRiverSourcePotential(x, y, info)) {
+                return 0;
+            }
+            const moistureScore = clamp01((info.moisture - RIVER_SOURCE_MIN_MOISTURE) / (1 - RIVER_SOURCE_MIN_MOISTURE));
+            const elevationScore = clamp01((info.elevation - RIVER_SOURCE_MIN_ELEVATION) / (RIVER_SOURCE_MAX_ELEVATION - RIVER_SOURCE_MIN_ELEVATION));
+            const glacierScore = Math.max(
+                info.waterIceFactor || 0,
+                clamp01((0.42 - info.temperature) / 0.42)
+            );
+            const glacierBonus = glacierScore >= RIVER_SOURCE_MIN_GLACIER ? glacierScore * 1.3 : glacierScore * 0.5;
+            return 1 + (moistureScore * 0.9) + (elevationScore * 1.1) + glacierBonus;
+        }
+
+        function getFlowDirectionByBit(directionBit) {
+            for (const direction of FLOW_DIRECTIONS) {
+                if (direction.bit === directionBit) {
+                    return direction;
+                }
+            }
+            return null;
+        }
+
+        function getRiverFlowDirection(x, y, info) {
+            if (!ENABLE_RIVER_OVERLAY || !isRiverLandTile(info)) {
+                return 0;
+            }
+            const key = `${x},${y}`;
+            if (riverFlowDirectionCache.has(key)) {
+                return riverFlowDirectionCache.get(key);
+            }
+
+            let bestDirection = 0;
+            let bestSlope = 0;
+            let smallestRise = Number.POSITIVE_INFINITY;
+            let spillDirection = 0;
+            for (const direction of FLOW_DIRECTIONS) {
+                const nx = x + direction.dx;
+                const ny = y + direction.dy;
+                const neighborInfo = getCachedTerrainInfo(nx, ny);
+                const drop = info.elevation - neighborInfo.elevation;
+                if (drop > RIVER_MIN_FLOW_DROP) {
+                    const slope = drop / direction.length;
+                    if (slope > bestSlope) {
+                        bestSlope = slope;
+                        bestDirection = direction.bit;
+                    }
+                }
+                if (drop <= 0) {
+                    const rise = -drop;
+                    if (rise < smallestRise) {
+                        smallestRise = rise;
+                        spillDirection = direction.bit;
+                    }
+                }
+            }
+            if (bestDirection === 0 && smallestRise <= RIVER_LAKE_SPILL_MAX_RISE) {
+                bestDirection = spillDirection;
+            }
+
+            riverFlowDirectionCache.set(key, bestDirection);
+            return bestDirection;
+        }
+
+        function isRiverTerminalWaterTile(info) {
+            return (
+                info.zone === "outside" ||
+                info.biome === "ocean" ||
+                info.biome === "shallow_water" ||
+                info.biome === "coast"
+            );
+        }
+
+        function getRiverFlowAccumulation(x, y, info, visitedKeys = null) {
+            if (!ENABLE_RIVER_OVERLAY || !isRiverLandTile(info)) {
+                return 0;
+            }
+            const cacheKey = `${x},${y}`;
+            if (!visitedKeys && riverFlowAccumulationCache.has(cacheKey)) {
+                return riverFlowAccumulationCache.get(cacheKey);
+            }
+
+            const visitSet = visitedKeys || new Set();
+            if (visitSet.has(cacheKey)) {
+                return 0;
+            }
+            visitSet.add(cacheKey);
+
+            let accumulation = getRiverSourceWeight(x, y, info);
+            for (const direction of FLOW_DIRECTIONS) {
+                const nx = x + direction.dx;
+                const ny = y + direction.dy;
+                const neighborInfo = getCachedTerrainInfo(nx, ny);
+                if (!isRiverLandTile(neighborInfo)) {
+                    continue;
+                }
+                const neighborFlowDirection = getRiverFlowDirection(nx, ny, neighborInfo);
+                if (neighborFlowDirection !== direction.oppositeBit) {
+                    continue;
+                }
+                const upstreamAccumulation = getRiverFlowAccumulation(nx, ny, neighborInfo, visitSet);
+                accumulation += upstreamAccumulation * RIVER_FLOW_ATTENUATION;
+            }
+
+            visitSet.delete(cacheKey);
+            if (!visitedKeys) {
+                riverFlowAccumulationCache.set(cacheKey, accumulation);
+            }
+            return accumulation;
+        }
+
+        function isRiverTileActive(x, y, info) {
+            if (!ENABLE_RIVER_OVERLAY || !isRiverLandTile(info)) {
+                return false;
+            }
+            const cacheKey = `${x},${y}`;
+            if (riverTileActiveCache.has(cacheKey)) {
+                return riverTileActiveCache.get(cacheKey);
+            }
+
+            const localSource = hasLocalRiverSourcePotential(x, y, info);
+            const flowAccumulation = getRiverFlowAccumulation(x, y, info);
+            const isActive = localSource || flowAccumulation >= RIVER_MIN_VISIBLE_FLOW;
+
+            riverTileActiveCache.set(cacheKey, isActive);
+            return isActive;
+        }
+
+        function getPrimaryIncomingDirection(x, y) {
+            let bestIncoming = 0;
+            let bestIncomingAccumulation = 0;
+            for (const direction of FLOW_DIRECTIONS) {
+                const nx = x + direction.dx;
+                const ny = y + direction.dy;
+                const neighborInfo = getCachedTerrainInfo(nx, ny);
+                if (!isRiverLandTile(neighborInfo)) {
+                    continue;
+                }
+                const neighborFlowDirection = getRiverFlowDirection(nx, ny, neighborInfo);
+                if (neighborFlowDirection !== direction.oppositeBit) {
+                    continue;
+                }
+                if (!isRiverTileActive(nx, ny, neighborInfo)) {
+                    continue;
+                }
+                const neighborAccumulation = getRiverFlowAccumulation(nx, ny, neighborInfo);
+                if (neighborAccumulation > bestIncomingAccumulation) {
+                    bestIncomingAccumulation = neighborAccumulation;
+                    bestIncoming = direction.bit;
+                }
+            }
+            return bestIncoming;
+        }
+
+        function ensureRiverInfo(x, y, info) {
+            if (info.riverComputed) {
+                return info;
+            }
+
+            const flowDirection = getRiverFlowDirection(x, y, info);
+            const incomingDirection = getPrimaryIncomingDirection(x, y);
+            const isActive = isRiverTileActive(x, y, info);
+            const flowAccumulation = getRiverFlowAccumulation(x, y, info);
+
+            let riverMask = 0;
+            if (isActive) {
+                if (incomingDirection !== 0) {
+                    riverMask |= incomingDirection;
+                }
+                // One river per tile: one outgoing channel direction.
+                // It continues until it reaches sea/coast, or stops when all exits are uphill.
+                if (flowDirection !== 0) {
+                    riverMask |= flowDirection;
+                }
+            }
+            if (riverMask === 0 && incomingDirection !== 0 && isActive) {
+                riverMask = incomingDirection;
+            }
+            if (riverMask === 0 && flowDirection !== 0 && isActive) {
+                riverMask |= flowDirection;
+            }
+            let riverHasLakeBasin = false;
+            let riverDeltaCandidate = false;
+            if (isActive && flowDirection !== 0) {
+                const dir = getFlowDirectionByBit(flowDirection);
+                if (dir) {
+                    const neighborInfo = getCachedTerrainInfo(x + dir.dx, y + dir.dy);
+                    if (isRiverLandTile(neighborInfo)) {
+                        riverHasLakeBasin = neighborInfo.elevation >= info.elevation;
+                    } else if (isRiverTerminalWaterTile(neighborInfo) && flowAccumulation >= RIVER_DELTA_FLOW_THRESHOLD) {
+                        riverDeltaCandidate = true;
+                    }
+                }
+            }
+            if (isActive && flowDirection === 0 && incomingDirection !== 0) {
+                riverHasLakeBasin = true;
+            }
+
+            info.hasRiver = riverMask !== 0;
+            info.riverDirectionMask = riverMask;
+            info.riverOrientation = getRiverOrientationFromMask(riverMask);
+            info.riverFlowWeight = flowAccumulation;
+            info.riverThickness = Math.max(0, Math.log2(1 + Math.max(0, flowAccumulation)));
+            info.riverOutgoingDirection = flowDirection;
+            info.riverIncomingDirection = incomingDirection;
+            info.riverHasLakeBasin = riverHasLakeBasin;
+            info.riverDeltaCandidate = riverDeltaCandidate;
+            info.riverComputed = true;
+            return info;
+        }
+
         function pickBiome(temperature, moisture, finalElevation, ridge) {
             // Name biome from final (post-ridge) elevation first, then climate.
             if (finalElevation > 0.86) return "mountaintop";
@@ -288,7 +596,17 @@
                     ridge: 0,
                     oceanIceFactor: 0,
                     waterIceFactor: 0,
-                    zone: "outside"
+                    zone: "outside",
+                    hasRiver: false,
+                    riverDirectionMask: 0,
+                    riverOrientation: "none",
+                    riverFlowWeight: 0,
+                    riverThickness: 0,
+                    riverIncomingDirection: 0,
+                    riverOutgoingDirection: 0,
+                    riverHasLakeBasin: false,
+                    riverDeltaCandidate: false,
+                    riverComputed: true
                 };
             }
 
@@ -439,7 +757,17 @@
                     ridge: ridge,
                     oceanIceFactor: oceanIceFactor,
                     waterIceFactor: waterIceFactor,
-                    zone: "inland"
+                    zone: "inland",
+                    hasRiver: false,
+                    riverDirectionMask: 0,
+                    riverOrientation: "none",
+                    riverFlowWeight: 0,
+                    riverThickness: 0,
+                    riverIncomingDirection: 0,
+                    riverOutgoingDirection: 0,
+                    riverHasLakeBasin: false,
+                    riverDeltaCandidate: false,
+                    riverComputed: false
                 };
             }
             if (elevated < 0.10) {
@@ -452,7 +780,17 @@
                     ridge: ridge,
                     oceanIceFactor: oceanIceFactor,
                     waterIceFactor: waterIceFactor,
-                    zone: "inland"
+                    zone: "inland",
+                    hasRiver: false,
+                    riverDirectionMask: 0,
+                    riverOrientation: "none",
+                    riverFlowWeight: 0,
+                    riverThickness: 0,
+                    riverIncomingDirection: 0,
+                    riverOutgoingDirection: 0,
+                    riverHasLakeBasin: false,
+                    riverDeltaCandidate: false,
+                    riverComputed: false
                 };
             }
             if (elevated < 0.12) {
@@ -465,7 +803,17 @@
                     ridge: ridge,
                     oceanIceFactor: oceanIceFactor,
                     waterIceFactor: waterIceFactor,
-                    zone: "inland"
+                    zone: "inland",
+                    hasRiver: false,
+                    riverDirectionMask: 0,
+                    riverOrientation: "none",
+                    riverFlowWeight: 0,
+                    riverThickness: 0,
+                    riverIncomingDirection: 0,
+                    riverOutgoingDirection: 0,
+                    riverHasLakeBasin: false,
+                    riverDeltaCandidate: false,
+                    riverComputed: false
                 };
             }
 
@@ -482,7 +830,17 @@
                 ridge: ridge,
                 oceanIceFactor: oceanIceFactor,
                 waterIceFactor: waterIceFactor,
-                zone: "inland"
+                zone: "inland",
+                hasRiver: false,
+                riverDirectionMask: 0,
+                riverOrientation: "none",
+                riverFlowWeight: 0,
+                riverThickness: 0,
+                riverIncomingDirection: 0,
+                riverOutgoingDirection: 0,
+                riverHasLakeBasin: false,
+                riverDeltaCandidate: false,
+                riverComputed: false
             };
         }
 
@@ -571,7 +929,95 @@
         // At his point we assume the x and y are the top-left corner of the tile, and the size is the size of the tile.
         // Also, the coordinates are already transformed by the zoom level and translation.
         // Note that the tile may be partially visible, so you may need to draw a partial tile.
-        function drawTile(info, x, y, size, targetContext = context) {
+        function drawRiverOverlay(info, x0, y0, drawW, drawH, size, targetContext) {
+            if (!info.hasRiver || size < RIVER_MIN_DRAW_PIXEL_SIZE) {
+                return;
+            }
+
+            const riverColor = (useIceColorBlending && info.temperature < WATER_ICE_TEMPERATURE_END)
+                ? mixHexColors(RIVER_COLOR, RIVER_ICE_COLOR, clamp01((WATER_ICE_TEMPERATURE_END - info.temperature) / 0.24))
+                : RIVER_COLOR;
+            const mask = info.riverDirectionMask;
+            const cx = x0 + (drawW * 0.5);
+            const cy = y0 + (drawH * 0.5);
+            const northY = y0;
+            const southY = y0 + drawH;
+            const westX = x0;
+            const eastX = x0 + drawW;
+            const thickness = Math.max(0, info.riverThickness || 0);
+            const widthFactor = RIVER_LINE_WIDTH_FACTOR + (thickness * 0.08);
+            const lineWidth = Math.max(1, size * widthFactor);
+
+            targetContext.strokeStyle = riverColor;
+            targetContext.lineWidth = lineWidth;
+            targetContext.lineCap = "round";
+            targetContext.lineJoin = "round";
+
+            if (mask & RIVER_DIR_NORTH) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(cx, northY);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_EAST) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(eastX, cy);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_SOUTH) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(cx, southY);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_WEST) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(westX, cy);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_NORTHEAST) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(eastX, northY);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_SOUTHEAST) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(eastX, southY);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_SOUTHWEST) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(westX, southY);
+                targetContext.stroke();
+            }
+            if (mask & RIVER_DIR_NORTHWEST) {
+                targetContext.beginPath();
+                targetContext.moveTo(cx, cy);
+                targetContext.lineTo(westX, northY);
+                targetContext.stroke();
+            }
+            if (info.riverHasLakeBasin) {
+                targetContext.fillStyle = riverColor;
+                targetContext.beginPath();
+                targetContext.arc(cx, cy, Math.max(1.2, lineWidth * 0.75), 0, Math.PI * 2);
+                targetContext.fill();
+            }
+            if (info.riverDeltaCandidate) {
+                targetContext.fillStyle = riverColor;
+                targetContext.globalAlpha = 0.55;
+                targetContext.beginPath();
+                targetContext.arc(cx, cy, Math.max(1.5, lineWidth * 1.25), 0, Math.PI * 2);
+                targetContext.fill();
+                targetContext.globalAlpha = 1;
+            }
+        }
+
+        function drawTile(info, x, y, size, targetContext = context, tileX = null, tileY = null) {
             // Snap to device pixels to prevent anti-aliased seams between adjacent tiles.
             const x0 = Math.floor(x);
             const y0 = Math.floor(y);
@@ -579,12 +1025,16 @@
             const y1 = Math.ceil(y + size);
             const drawW = Math.max(1, x1 - x0);
             const drawH = Math.max(1, y1 - y0);
+            if (tileX !== null && tileY !== null) {
+                ensureRiverInfo(tileX, tileY, info);
+            }
 
             // Below 3 px, textures lose detail and cost more than they add; use flat color fallback.
             const pattern = (size >= MIN_TEXTURE_TILE_PIXEL_SIZE) ? getTerrainPattern(info, targetContext) : null;
             if (pattern) {
                 targetContext.fillStyle = pattern;
                 targetContext.fillRect(x0, y0, drawW, drawH);
+                drawRiverOverlay(info, x0, y0, drawW, drawH, size, targetContext);
                 return;
             }
 
@@ -612,6 +1062,7 @@
                     targetContext.fillStyle = TERRAIN_COLORS[terrain] || "#ff00ff";
             }
             targetContext.fillRect(x0, y0, drawW, drawH);
+            drawRiverOverlay(info, x0, y0, drawW, drawH, size, targetContext);
         }
 
         // Compute visible world tile range directly from transform (no player-position projection).
@@ -629,7 +1080,7 @@
                 for (let y = y0; y < y1; y += 1) {
                     const ypos = y * tilePx + transform.y;
                     const info = getCachedTerrainInfo(x, y);
-                    tiles.push({ info: info, x: xpos, y: ypos, size: tilePx });
+                    tiles.push({ info: info, x: xpos, y: ypos, size: tilePx, tileX: x, tileY: y });
                 }
             }
             return tiles;
@@ -740,7 +1191,7 @@
             if (!USE_ALLOCATION_FREE_REDRAW) {
                 const tiles = computeTiles(transform);
                 tiles.forEach(tile => {
-                    drawTile(tile.info, tile.x, tile.y, tile.size, terrainLayerContext);
+                    drawTile(tile.info, tile.x, tile.y, tile.size, terrainLayerContext, tile.tileX, tile.tileY);
                 });
                 return;
             }
@@ -757,7 +1208,7 @@
                 for (let y = y0; y < y1; y += 1) {
                     const ypos = y * tilePx + transform.y;
                     const info = getCachedTerrainInfo(x, y);
-                    drawTile(info, xpos, ypos, tilePx, terrainLayerContext);
+                    drawTile(info, xpos, ypos, tilePx, terrainLayerContext, x, y);
                 }
             }
         }
@@ -850,7 +1301,7 @@
             .on("input", function() {
                 const value = Number(this.value);
                 moistureMultiplier = value / 100;
-                terrainCache.clear();
+                clearTerrainDerivedCaches();
                 moistureLabel.text(`Moisture: ${value}%`);
                 redraw(currentTransform);
             });
@@ -867,7 +1318,7 @@
             .on("input", function() {
                 const value = Number(this.value);
                 mountainMultiplier = value / 100;
-                terrainCache.clear();
+                clearTerrainDerivedCaches();
                 mountainLabel.text(`Mountains: ${value}%`);
                 redraw(currentTransform);
             });
@@ -884,7 +1335,7 @@
             .on("input", function() {
                 const value = Number(this.value);
                 islandShapeMultiplier = value / 100;
-                terrainCache.clear();
+                clearTerrainDerivedCaches();
                 islandLabel.text(`Island Shape: ${value}%`);
                 redraw(currentTransform);
             });
@@ -1096,6 +1547,7 @@
             const tileX = Math.floor((mouseX - currentTransform.x) / tilePx);
             const tileY = Math.floor((mouseY - currentTransform.y) / tilePx);
             const info = getCachedTerrainInfo(tileX, tileY);
+            ensureRiverInfo(tileX, tileY, info);
             const color = TERRAIN_COLORS[info.terrain] || "n/a";
 
             tooltip
@@ -1110,6 +1562,13 @@
                     `Moisture: ${info.moisture.toFixed(3)}<br>` +
                     `Temp: ${info.temperature.toFixed(3)}<br>` +
                     `Ridge: ${info.ridge.toFixed(3)}<br>` +
+                    `River: ${info.hasRiver ? "yes" : "no"}<br>` +
+                    `River Mask: ${info.riverDirectionMask}<br>` +
+                    `River Orientation: ${info.riverOrientation}<br>` +
+                    `River Flow: ${(info.riverFlowWeight || 0).toFixed(2)}<br>` +
+                    `River Thickness: ${(info.riverThickness || 0).toFixed(2)}<br>` +
+                    `River Basin: ${info.riverHasLakeBasin ? "yes" : "no"}<br>` +
+                    `River Delta: ${info.riverDeltaCandidate ? "yes" : "no"}<br>` +
                     `Zoom: ${currentTransform.k.toFixed(2)}`
                 );
         });
