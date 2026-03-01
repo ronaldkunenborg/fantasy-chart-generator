@@ -1661,6 +1661,7 @@
                 tiles.forEach(tile => {
                     drawTile(tile.info, tile.x, tile.y, tile.size, terrainLayerContext, tile.tileX, tile.tileY);
                 });
+                drawRiverOverlayLayer(transform, terrainLayerContext);
                 return;
             }
 
@@ -1679,6 +1680,7 @@
                     drawTile(info, xpos, ypos, tilePx, terrainLayerContext, x, y);
                 }
             }
+            drawRiverOverlayLayer(transform, terrainLayerContext);
         }
 
         function drawRiverOverlayLayer(transform, targetContext) {
@@ -1713,7 +1715,6 @@
             }
             context.clearRect(0, 0, canvas.width, canvas.height);
             context.drawImage(terrainLayerCanvas, 0, 0);
-            drawRiverOverlayLayer(transform, context);
             drawCloudOverlay(transform);
             const renderMs = performance.now() - frameStart;
             renderMsEma = (renderMsEma === 0) ? renderMs : ((renderMsEma * 0.85) + (renderMs * 0.15));
