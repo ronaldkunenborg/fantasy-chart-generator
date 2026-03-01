@@ -1,5 +1,6 @@
 ## Project rules
 - All explicit project rules from the user must be added to AGENTS.md by Codex.
+- Water modeling should be improved toward realistic ocean connectivity, inland lakes, and mountain-fed river systems.
 - Sea and ocean tiles should become ice at sufficiently low temperatures.
 - Rivers should be rendered as an overlay/add-on on top of terrain tiles, not as full-tile terrain replacement.
 - River metadata must include both presence and orientation so rendering can be applied afterward.

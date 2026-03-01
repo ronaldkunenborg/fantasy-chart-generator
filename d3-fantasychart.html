@@ -80,6 +80,7 @@
         const TERRAIN_COLORS = {
             ocean: "#37498b",
             water: "#6b81da",
+            lake: "#5f78cf",
             ocean_ice: "#b9c9e3",
             water_ice: "#d4e3f2",
             beach: "#d3ba75",
@@ -105,6 +106,10 @@
         const WATER_ICE_TEMPERATURE_START = 0.22;
         const WATER_ICE_TEMPERATURE_END = 0.34;
         const ICE_TRANSITION_NOISE_STRENGTH = 0.08;
+        const BASE_OCEAN_ELEVATION = 0.08;
+        const BASE_WATER_ELEVATION = 0.10;
+        const BASE_COAST_ELEVATION = 0.12;
+        const OCEAN_CONNECTIVITY_MAX_NODES = 28000;
         const ENABLE_RIVER_OVERLAY = true;
         const RIVER_MIN_FLOW_DROP = 0.001;
         const RIVER_SOURCE_MIN_MOISTURE = 0.34;
@@ -112,9 +117,12 @@
         const RIVER_SOURCE_MAX_ELEVATION = 0.96;
         const RIVER_SOURCE_MIN_RIDGE = 0.45;
         const RIVER_SOURCE_MIN_GLACIER = 0.08;
-        const RIVER_LAKE_SPILL_MAX_RISE = 0.002;
+        const RIVER_SOURCE_NOISE_ZOOM = 140;
+        const RIVER_SOURCE_NOISE_THRESHOLD = 0.6;
+        const RIVER_SOURCE_MIN_DOWNHILL_NEIGHBORS = 2;
+        const RIVER_LAKE_SPILL_MAX_RISE = 0.0014;
         const RIVER_FLOW_ATTENUATION = 1.0;
-        const RIVER_MIN_VISIBLE_FLOW = 0.9;
+        const RIVER_MIN_VISIBLE_FLOW = 1.35;
         const RIVER_DELTA_FLOW_THRESHOLD = 7.5;
         const RIVER_MIN_DRAW_PIXEL_SIZE = 2;
         const RIVER_LINE_WIDTH_FACTOR = 0.22;
@@ -135,6 +143,7 @@
         const PATH_TARGET_PULL = 0.045;
         const PATH_AWAY_TARGET_PENALTY = 1.15;
         const PATH_PREVIEW_COLOR = "rgba(44, 130, 240, 0.86)";
+        const PATH_PREVIEW_DRAW_OVER_WATER = false;
 
         // World terrain/biome reference ranges for later biome correlation work.
         // Temperature + precipitation values are based on NASA "Mission: Biomes":
@@ -190,7 +199,9 @@
             coastalMountainSuppressionStart: 0.72
         };
 
+        const terrainBaseCache = new Map();
         const terrainCache = new Map();
+        const oceanConnectivityCache = new Map();
         const terrainPatternCache = new Map();
         const terrainPatternLoadState = new Map();
         const riverSourceCache = new Map();
@@ -291,7 +302,9 @@
         }
 
         function clearTerrainDerivedCaches() {
+            terrainBaseCache.clear();
             terrainCache.clear();
+            oceanConnectivityCache.clear();
             riverSourceCache.clear();
             riverFlowDirectionCache.clear();
             riverFlowAccumulationCache.clear();
@@ -307,6 +320,7 @@
                 info.zone === "outside" ||
                 info.biome === "ocean" ||
                 info.biome === "shallow_water" ||
+                info.biome === "lake" ||
                 info.biome === "coast"
             );
         }
@@ -350,6 +364,7 @@
                 info.zone === "inland" &&
                 info.biome !== "ocean" &&
                 info.biome !== "shallow_water" &&
+                info.biome !== "lake" &&
                 info.biome !== "coast"
             );
         }
@@ -554,6 +569,7 @@
                 info.zone === "inland" &&
                 info.biome !== "ocean" &&
                 info.biome !== "shallow_water" &&
+                info.biome !== "lake" &&
                 info.biome !== "coast"
             );
         }
@@ -589,13 +605,36 @@
             if (riverSourceCache.has(sourceKey)) {
                 return riverSourceCache.get(sourceKey);
             }
+            let downhillNeighborCount = 0;
+            for (const direction of FLOW_DIRECTIONS) {
+                const neighborInfo = getCachedTerrainInfo(x + direction.dx, y + direction.dy);
+                if (!isRiverLandTile(neighborInfo)) {
+                    continue;
+                }
+                if ((info.elevation - neighborInfo.elevation) > RIVER_MIN_FLOW_DROP) {
+                    downhillNeighborCount += 1;
+                }
+            }
+            const moistureScore = clamp01((info.moisture - RIVER_SOURCE_MIN_MOISTURE) / (1 - RIVER_SOURCE_MIN_MOISTURE));
             const glacierFactor = Math.max(
                 info.waterIceFactor || 0,
                 clamp01((0.42 - info.temperature) / 0.42)
             );
-            // Any sufficiently moist/elevated mountain tile is a headwater source.
-            // Glacier/cold conditions increase source weight, but do not fully gate source creation.
-            const hasSource = true;
+            const sourceNoise = normalizeNoise(
+                fbmNoise2(
+                    x,
+                    y,
+                    RIVER_SOURCE_NOISE_ZOOM,
+                    TERRAIN_MODEL.ridgeOffsetX + 12917,
+                    TERRAIN_MODEL.ridgeOffsetY - 4813
+                )
+            );
+            const adaptiveThreshold = clamp01(
+                RIVER_SOURCE_NOISE_THRESHOLD - (moistureScore * 0.08) - (glacierFactor * 0.1)
+            );
+            const hasSource =
+                downhillNeighborCount >= RIVER_SOURCE_MIN_DOWNHILL_NEIGHBORS &&
+                sourceNoise >= adaptiveThreshold;
             riverSourceCache.set(sourceKey, hasSource);
             return hasSource;
         }
@@ -611,7 +650,19 @@
                 clamp01((0.42 - info.temperature) / 0.42)
             );
             const glacierBonus = glacierScore >= RIVER_SOURCE_MIN_GLACIER ? glacierScore * 1.3 : glacierScore * 0.5;
-            return 1 + (moistureScore * 0.9) + (elevationScore * 1.1) + glacierBonus;
+            const sourceNoise = normalizeNoise(
+                fbmNoise2(
+                    x,
+                    y,
+                    RIVER_SOURCE_NOISE_ZOOM,
+                    TERRAIN_MODEL.ridgeOffsetX + 12917,
+                    TERRAIN_MODEL.ridgeOffsetY - 4813
+                )
+            );
+            const sourceConcentration = clamp01(
+                (sourceNoise - RIVER_SOURCE_NOISE_THRESHOLD) / (1 - RIVER_SOURCE_NOISE_THRESHOLD)
+            );
+            return 0.9 + (moistureScore * 0.9) + (elevationScore * 1.0) + glacierBonus + (sourceConcentration * 0.7);
         }
 
         function getFlowDirectionByBit(directionBit) {
@@ -633,7 +684,9 @@
             }
 
             let bestDirection = 0;
-            let bestSlope = 0;
+            let bestSlope = Number.NEGATIVE_INFINITY;
+            let bestWaterExitDirection = 0;
+            let bestWaterExitScore = Number.NEGATIVE_INFINITY;
             let smallestRise = Number.POSITIVE_INFINITY;
             let spillDirection = 0;
             for (const direction of FLOW_DIRECTIONS) {
@@ -641,20 +694,31 @@
                 const ny = y + direction.dy;
                 const neighborInfo = getCachedTerrainInfo(nx, ny);
                 const drop = info.elevation - neighborInfo.elevation;
+                const slope = drop / direction.length;
+
+                if (isRiverTerminalWaterTile(neighborInfo) && drop >= -RIVER_LAKE_SPILL_MAX_RISE) {
+                    const waterExitScore = slope + 0.08;
+                    if (waterExitScore > bestWaterExitScore) {
+                        bestWaterExitScore = waterExitScore;
+                        bestWaterExitDirection = direction.bit;
+                    }
+                }
                 if (drop > RIVER_MIN_FLOW_DROP) {
-                    const slope = drop / direction.length;
                     if (slope > bestSlope) {
                         bestSlope = slope;
                         bestDirection = direction.bit;
                     }
                 }
-                if (drop <= 0) {
+                if (drop <= 0 && isRiverLandTile(neighborInfo)) {
                     const rise = -drop;
                     if (rise < smallestRise) {
                         smallestRise = rise;
                         spillDirection = direction.bit;
                     }
                 }
+            }
+            if (bestDirection === 0 && bestWaterExitDirection !== 0) {
+                bestDirection = bestWaterExitDirection;
             }
             if (bestDirection === 0 && smallestRise <= RIVER_LAKE_SPILL_MAX_RISE) {
                 bestDirection = spillDirection;
@@ -669,7 +733,17 @@
                 info.zone === "outside" ||
                 info.biome === "ocean" ||
                 info.biome === "shallow_water" ||
+                info.biome === "lake" ||
                 info.biome === "coast"
+            );
+        }
+
+        function isOceanConnectedTerminalWaterTile(info) {
+            return (
+                info.zone === "outside" ||
+                info.biome === "ocean" ||
+                info.biome === "shallow_water" ||
+                info.oceanConnectedWater === true
             );
         }
 
@@ -789,7 +863,10 @@
                     const neighborInfo = getCachedTerrainInfo(x + dir.dx, y + dir.dy);
                     if (isRiverLandTile(neighborInfo)) {
                         riverHasLakeBasin = neighborInfo.elevation >= info.elevation;
-                    } else if (isRiverTerminalWaterTile(neighborInfo) && flowAccumulation >= RIVER_DELTA_FLOW_THRESHOLD) {
+                    } else if (
+                        isOceanConnectedTerminalWaterTile(neighborInfo) &&
+                        flowAccumulation >= RIVER_DELTA_FLOW_THRESHOLD
+                    ) {
                         riverDeltaCandidate = true;
                     }
                 }
@@ -853,31 +930,40 @@
             }
         }
 
-        function getTerrainInfo(x, y) {
-            const isOutsideMap = (x < MAP_X_MIN || x > MAP_X_MAX || y < MAP_Y_MIN || y > MAP_Y_MAX);
+        function isInsideMap(x, y) {
+            return x >= MAP_X_MIN && x <= MAP_X_MAX && y >= MAP_Y_MIN && y <= MAP_Y_MAX;
+        }
 
-            if (isOutsideMap) {
-                return {
-                    terrain: "ocean",
-                    biome: "ocean",
-                    elevation: 0,
-                    moisture: 0,
-                    temperature: 0,
-                    ridge: 0,
-                    oceanIceFactor: 0,
-                    waterIceFactor: 0,
-                    zone: "outside",
-                    hasRiver: false,
-                    riverDirectionMask: 0,
-                    riverOrientation: "none",
-                    riverFlowWeight: 0,
-                    riverThickness: 0,
-                    riverIncomingDirection: 0,
-                    riverOutgoingDirection: 0,
-                    riverHasLakeBasin: false,
-                    riverDeltaCandidate: false,
-                    riverComputed: true
-                };
+        function createTerrainInfoFromSample(baseSample, terrain, biome, waterBodyType, oceanConnectedWater) {
+            return {
+                terrain: terrain,
+                biome: biome,
+                elevation: baseSample.elevation,
+                moisture: baseSample.moisture,
+                temperature: baseSample.temperature,
+                ridge: baseSample.ridge,
+                oceanIceFactor: baseSample.oceanIceFactor,
+                waterIceFactor: baseSample.waterIceFactor,
+                zone: baseSample.zone,
+                waterBodyType: waterBodyType,
+                oceanConnectedWater: !!oceanConnectedWater,
+                hasRiver: false,
+                riverDirectionMask: 0,
+                riverOrientation: "none",
+                riverFlowWeight: 0,
+                riverThickness: 0,
+                riverIncomingDirection: 0,
+                riverOutgoingDirection: 0,
+                riverHasLakeBasin: false,
+                riverDeltaCandidate: false,
+                riverComputed: false
+            };
+        }
+
+        function getBaseTerrainSample(x, y) {
+            const baseKey = `${x},${y}`;
+            if (terrainBaseCache.has(baseKey)) {
+                return terrainBaseCache.get(baseKey);
             }
 
             // [Item 1] Base terrain signals (Red Blob style): compute independent elevation/moisture noise fields.
@@ -894,7 +980,6 @@
             moisture = clamp01(moisture * moistureMultiplier);
 
             // [Item 3] Replace hard rectangular edge tiles with center-distance island shaping.
-            // Distance function (radial): 0 near center, ~1 near map boundary.
             const centerX = (MAP_X_MIN + MAP_X_MAX) * 0.5;
             const centerY = (MAP_Y_MIN + MAP_Y_MAX) * 0.5;
             const halfWidth = (MAP_X_MAX - MAP_X_MIN) * 0.5;
@@ -916,12 +1001,9 @@
             );
             const islandMixValue = clamp01(0.20 + (islandShapeMultiplier * 0.70)); // 50% -> 0.55 baseline
             const islandJitterValue = 0.06 + (islandShapeMultiplier * 0.24); // 50% -> 0.18 baseline
-            centerDistance = clamp01(
-                centerDistance + ((coastNoise - 0.5) * islandJitterValue)
-            );
+            centerDistance = clamp01(centerDistance + ((coastNoise - 0.5) * islandJitterValue));
 
             // [Item 5] Blend in an island target (1 - distance), but only as a lowering pass.
-            // This keeps edge-water shaping while avoiding aggressive center uplift.
             const islandTargetElevation = 1 - centerDistance;
             const islandLoweredElevation = Math.min(elevation, islandTargetElevation);
             elevation = clamp01(
@@ -955,7 +1037,7 @@
             const mountainBaseline =
                 TERRAIN_MODEL.mountainBaseEdge +
                 (TERRAIN_MODEL.mountainBaseCore - TERRAIN_MODEL.mountainBaseEdge) * mountainProfile;
-            const mountainStrength = 0.2 + (mountainMultiplier * 1.6); // 0..100% maps to 0.2..1.8, 50% ~= baseline
+            const mountainStrength = 0.2 + (mountainMultiplier * 1.6); // 0..100% maps to 0.2..1.8
             const mountainEdgeGate = 1 - smoothstep(
                 TERRAIN_MODEL.coastalMountainSuppressionStart,
                 1,
@@ -978,7 +1060,7 @@
             const waterBaseline =
                 TERRAIN_MODEL.waterBaseEdge +
                 (TERRAIN_MODEL.waterBaseCore - TERRAIN_MODEL.waterBaseEdge) * waterProfile;
-            const waterLowlandGate = 1 - smoothstep(0.38, 0.60, elevation); // only carve strongly in lower terrain
+            const waterLowlandGate = 1 - smoothstep(0.38, 0.60, elevation);
             const waterBlend = clamp01(waterRegion * TERRAIN_MODEL.waterBlendStrength * waterLowlandGate);
             elevation = clamp01((elevation * (1 - waterBlend)) + (waterBaseline * waterBlend));
 
@@ -997,9 +1079,7 @@
             const iceTransitionNoise = normalizeNoise(
                 fbmNoise2(x, y, NOISE_ZOOM * 18, TERRAIN_MODEL.coastOffsetX + 9503, TERRAIN_MODEL.coastOffsetY - 4711)
             );
-            const localIceTemp = clamp01(
-                temperature + ((iceTransitionNoise - 0.5) * ICE_TRANSITION_NOISE_STRENGTH)
-            );
+            const localIceTemp = clamp01(temperature + ((iceTransitionNoise - 0.5) * ICE_TRANSITION_NOISE_STRENGTH));
             const oceanIceFactor = 1 - smoothstep(
                 OCEAN_ICE_TEMPERATURE_START,
                 OCEAN_ICE_TEMPERATURE_END,
@@ -1015,103 +1095,185 @@
             const ridge = ridgedNoise2(x, y, NOISE_ZOOM * 0.9, TERRAIN_MODEL.ridgeOffsetX, TERRAIN_MODEL.ridgeOffsetY);
             const mountainBoost = smoothstep(0.58, 0.88, elevation) * smoothstep(0.55, 0.82, ridge);
             const elevated = clamp01(elevation + mountainBoost * 0.25);
-
-            // Water/coast bands first
-            if (elevated < 0.08) {
-                return {
-                    terrain: "ocean",
-                    biome: "ocean",
-                    elevation: elevated,
-                    moisture: moisture,
-                    temperature: temperature,
-                    ridge: ridge,
-                    oceanIceFactor: oceanIceFactor,
-                    waterIceFactor: waterIceFactor,
-                    zone: "inland",
-                    hasRiver: false,
-                    riverDirectionMask: 0,
-                    riverOrientation: "none",
-                    riverFlowWeight: 0,
-                    riverThickness: 0,
-                    riverIncomingDirection: 0,
-                    riverOutgoingDirection: 0,
-                    riverHasLakeBasin: false,
-                    riverDeltaCandidate: false,
-                    riverComputed: false
-                };
-            }
-            if (elevated < 0.10) {
-                return {
-                    terrain: "water",
-                    biome: "shallow_water",
-                    elevation: elevated,
-                    moisture: moisture,
-                    temperature: temperature,
-                    ridge: ridge,
-                    oceanIceFactor: oceanIceFactor,
-                    waterIceFactor: waterIceFactor,
-                    zone: "inland",
-                    hasRiver: false,
-                    riverDirectionMask: 0,
-                    riverOrientation: "none",
-                    riverFlowWeight: 0,
-                    riverThickness: 0,
-                    riverIncomingDirection: 0,
-                    riverOutgoingDirection: 0,
-                    riverHasLakeBasin: false,
-                    riverDeltaCandidate: false,
-                    riverComputed: false
-                };
-            }
-            if (elevated < 0.12) {
-                return {
-                    terrain: "beach",
-                    biome: "coast",
-                    elevation: elevated,
-                    moisture: moisture,
-                    temperature: temperature,
-                    ridge: ridge,
-                    oceanIceFactor: oceanIceFactor,
-                    waterIceFactor: waterIceFactor,
-                    zone: "inland",
-                    hasRiver: false,
-                    riverDirectionMask: 0,
-                    riverOrientation: "none",
-                    riverFlowWeight: 0,
-                    riverThickness: 0,
-                    riverIncomingDirection: 0,
-                    riverOutgoingDirection: 0,
-                    riverHasLakeBasin: false,
-                    riverDeltaCandidate: false,
-                    riverComputed: false
-                };
-            }
-
-            // Biome selection after ridge application, based on final elevation.
             const biome = pickBiome(temperature, moisture, elevated, ridge);
             const terrain = biomeToTerrain(biome);
 
-            return {
-                terrain: terrain,
-                biome: biome,
+            const sample = {
+                zone: "inland",
                 elevation: elevated,
                 moisture: moisture,
                 temperature: temperature,
                 ridge: ridge,
                 oceanIceFactor: oceanIceFactor,
                 waterIceFactor: waterIceFactor,
-                zone: "inland",
-                hasRiver: false,
-                riverDirectionMask: 0,
-                riverOrientation: "none",
-                riverFlowWeight: 0,
-                riverThickness: 0,
-                riverIncomingDirection: 0,
-                riverOutgoingDirection: 0,
-                riverHasLakeBasin: false,
-                riverDeltaCandidate: false,
-                riverComputed: false
+                landBiome: biome,
+                landTerrain: terrain,
+                isDeepWaterCandidate: elevated < BASE_OCEAN_ELEVATION,
+                isWaterCandidate: elevated < BASE_WATER_ELEVATION,
+                isCoastCandidate: elevated < BASE_COAST_ELEVATION
             };
+            terrainBaseCache.set(baseKey, sample);
+            return sample;
+        }
+
+        function isWaterCandidateSample(sample) {
+            return sample.zone === "inland" && sample.isWaterCandidate;
+        }
+
+        function isWaterConnectedToOcean(startX, startY) {
+            if (!isInsideMap(startX, startY)) {
+                return true;
+            }
+            const startKey = `${startX},${startY}`;
+            if (oceanConnectivityCache.has(startKey)) {
+                return oceanConnectivityCache.get(startKey);
+            }
+
+            const startSample = getBaseTerrainSample(startX, startY);
+            if (!isWaterCandidateSample(startSample)) {
+                oceanConnectivityCache.set(startKey, false);
+                return false;
+            }
+
+            const queue = [{ x: startX, y: startY }];
+            const localVisited = new Set([startKey]);
+            const localVisitedKeys = [];
+            let queueIndex = 0;
+            let connectedToOcean = false;
+            let resolvedByCache = false;
+
+            while (queueIndex < queue.length) {
+                const node = queue[queueIndex];
+                queueIndex += 1;
+                const nodeKey = `${node.x},${node.y}`;
+                localVisitedKeys.push(nodeKey);
+
+                if (oceanConnectivityCache.has(nodeKey)) {
+                    connectedToOcean = oceanConnectivityCache.get(nodeKey);
+                    resolvedByCache = true;
+                    break;
+                }
+
+                for (const direction of FLOW_DIRECTIONS) {
+                    const nx = node.x + direction.dx;
+                    const ny = node.y + direction.dy;
+                    if (!isInsideMap(nx, ny)) {
+                        connectedToOcean = true;
+                        resolvedByCache = true;
+                        break;
+                    }
+                    const neighborKey = `${nx},${ny}`;
+                    if (localVisited.has(neighborKey)) {
+                        continue;
+                    }
+                    const neighborSample = getBaseTerrainSample(nx, ny);
+                    if (!isWaterCandidateSample(neighborSample)) {
+                        continue;
+                    }
+                    localVisited.add(neighborKey);
+                    queue.push({ x: nx, y: ny });
+                    if (queue.length > OCEAN_CONNECTIVITY_MAX_NODES) {
+                        connectedToOcean = true;
+                        resolvedByCache = true;
+                        break;
+                    }
+                }
+                if (resolvedByCache) {
+                    break;
+                }
+            }
+
+            for (const key of localVisitedKeys) {
+                oceanConnectivityCache.set(key, connectedToOcean);
+            }
+            oceanConnectivityCache.set(startKey, connectedToOcean);
+            return connectedToOcean;
+        }
+
+        function hasAdjacentSurfaceWater(x, y) {
+            for (const direction of FLOW_DIRECTIONS) {
+                const nx = x + direction.dx;
+                const ny = y + direction.dy;
+                if (!isInsideMap(nx, ny)) {
+                    return true;
+                }
+                const neighborSample = getBaseTerrainSample(nx, ny);
+                if (isWaterCandidateSample(neighborSample)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function isAdjacentToOceanConnectedWater(x, y) {
+            for (const direction of FLOW_DIRECTIONS) {
+                const nx = x + direction.dx;
+                const ny = y + direction.dy;
+                if (!isInsideMap(nx, ny)) {
+                    return true;
+                }
+                const neighborSample = getBaseTerrainSample(nx, ny);
+                if (!isWaterCandidateSample(neighborSample)) {
+                    continue;
+                }
+                if (isWaterConnectedToOcean(nx, ny)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function getTerrainInfo(x, y) {
+            if (!isInsideMap(x, y)) {
+                return {
+                    terrain: "ocean",
+                    biome: "ocean",
+                    elevation: 0,
+                    moisture: 0,
+                    temperature: 0,
+                    ridge: 0,
+                    oceanIceFactor: 0,
+                    waterIceFactor: 0,
+                    zone: "outside",
+                    waterBodyType: "ocean",
+                    oceanConnectedWater: true,
+                    hasRiver: false,
+                    riverDirectionMask: 0,
+                    riverOrientation: "none",
+                    riverFlowWeight: 0,
+                    riverThickness: 0,
+                    riverIncomingDirection: 0,
+                    riverOutgoingDirection: 0,
+                    riverHasLakeBasin: false,
+                    riverDeltaCandidate: false,
+                    riverComputed: true
+                };
+            }
+
+            const baseSample = getBaseTerrainSample(x, y);
+            if (baseSample.isWaterCandidate) {
+                const oceanConnected = isWaterConnectedToOcean(x, y);
+                if (oceanConnected) {
+                    if (baseSample.isDeepWaterCandidate) {
+                        return createTerrainInfoFromSample(baseSample, "ocean", "ocean", "ocean", true);
+                    }
+                    return createTerrainInfoFromSample(baseSample, "water", "shallow_water", "sea", true);
+                }
+                return createTerrainInfoFromSample(baseSample, "water", "lake", "lake", false);
+            }
+
+            if (baseSample.isCoastCandidate && hasAdjacentSurfaceWater(x, y)) {
+                const oceanConnected = isAdjacentToOceanConnectedWater(x, y);
+                return createTerrainInfoFromSample(baseSample, "beach", "coast", "coast", oceanConnected);
+            }
+
+            return createTerrainInfoFromSample(
+                baseSample,
+                baseSample.landTerrain,
+                baseSample.landBiome,
+                "none",
+                false
+            );
         }
 
         // [Change 8] Determinism note:
@@ -1149,7 +1311,7 @@
 
         function getTerrainTextureVariant(info) {
             // Water/coast currently render with flat colors.
-            if (info.biome === "ocean" || info.biome === "shallow_water" || info.biome === "coast") {
+            if (info.biome === "ocean" || info.biome === "shallow_water" || info.biome === "lake" || info.biome === "coast") {
                 return null;
             }
 
@@ -1287,8 +1449,11 @@
             }
         }
 
-        function drawPathPreviewOverlay(tileX, tileY, x0, y0, drawW, drawH, targetContext) {
+        function drawPathPreviewOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext) {
             if (!ENABLE_OCEAN_MOUNTAIN_PATH_PREVIEW) {
+                return;
+            }
+            if (!PATH_PREVIEW_DRAW_OVER_WATER && isPathPreviewWaterTile(info)) {
                 return;
             }
             if (pathPreviewOceanReplacementTileCache.has(`${tileX},${tileY}`)) {
@@ -1331,7 +1496,7 @@
                 targetContext.fillRect(x0, y0, drawW, drawH);
                 if (tileX !== null && tileY !== null) {
                     drawPathOceanReplacementOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext);
-                    drawPathPreviewOverlay(tileX, tileY, x0, y0, drawW, drawH, targetContext);
+                    drawPathPreviewOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext);
                 }
                 return;
             }
@@ -1349,11 +1514,12 @@
                     break;
                 case "water":
                     if (useIceColorBlending && info.waterIceFactor > 0.01) {
-                        targetContext.fillStyle = mixHexColors(TERRAIN_COLORS.water, TERRAIN_COLORS.water_ice, info.waterIceFactor);
+                        const openWaterColor = info.biome === "lake" ? TERRAIN_COLORS.lake : TERRAIN_COLORS.water;
+                        targetContext.fillStyle = mixHexColors(openWaterColor, TERRAIN_COLORS.water_ice, info.waterIceFactor);
                     } else {
                         targetContext.fillStyle = USE_RANDOM_WATER_COLOR
                             ? `rgba(30, 125, ${Math.floor(200 + Math.random() * 55)}, 1)`
-                            : TERRAIN_COLORS.water;
+                            : (info.biome === "lake" ? TERRAIN_COLORS.lake : TERRAIN_COLORS.water);
                     }
                     break;
                 default:
@@ -1362,7 +1528,7 @@
             targetContext.fillRect(x0, y0, drawW, drawH);
             if (tileX !== null && tileY !== null) {
                 drawPathOceanReplacementOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext);
-                drawPathPreviewOverlay(tileX, tileY, x0, y0, drawW, drawH, targetContext);
+                drawPathPreviewOverlay(info, tileX, tileY, x0, y0, drawW, drawH, targetContext);
             }
         }
 
@@ -1515,6 +1681,31 @@
             }
         }
 
+        function drawRiverOverlayLayer(transform, targetContext) {
+            if (!ENABLE_RIVER_OVERLAY) {
+                return;
+            }
+            const k = transform.k;
+            const tilePx = TILE_SIZE * k;
+            const x0 = Math.floor((0 - transform.x) / tilePx) - 1;
+            const x1 = Math.floor((canvas.width - transform.x) / tilePx) + 2;
+            const y0 = Math.floor((0 - transform.y) / tilePx) - 1;
+            const y1 = Math.floor((canvas.height - transform.y) / tilePx) + 2;
+
+            for (let x = x0; x < x1; x += 1) {
+                const xpos = x * tilePx + transform.x;
+                for (let y = y0; y < y1; y += 1) {
+                    const ypos = y * tilePx + transform.y;
+                    const info = getCachedTerrainInfo(x, y);
+                    if (!isRiverLandTile(info)) {
+                        continue;
+                    }
+                    ensureRiverInfo(x, y, info);
+                    drawRiverOverlay(info, xpos, ypos, tilePx, tilePx, tilePx, targetContext);
+                }
+            }
+        }
+
         function composeFrame(transform) {
             const frameStart = performance.now();
             if (!terrainLayerCanvas) {
@@ -1522,6 +1713,7 @@
             }
             context.clearRect(0, 0, canvas.width, canvas.height);
             context.drawImage(terrainLayerCanvas, 0, 0);
+            drawRiverOverlayLayer(transform, context);
             drawCloudOverlay(transform);
             const renderMs = performance.now() - frameStart;
             renderMsEma = (renderMsEma === 0) ? renderMs : ((renderMsEma * 0.85) + (renderMs * 0.15));
@@ -1849,10 +2041,15 @@
             const tileX = Math.floor((mouseX - currentTransform.x) / tilePx);
             const tileY = Math.floor((mouseY - currentTransform.y) / tilePx);
             const info = getCachedTerrainInfo(tileX, tileY);
+            if (isRiverLandTile(info)) {
+                ensureRiverInfo(tileX, tileY, info);
+            }
             ensurePathPreviewTiles();
             const isPathTile = pathPreviewTileCache.has(`${tileX},${tileY}`);
             const isOceanReplacedPathTile = pathPreviewOceanReplacementTileCache.has(`${tileX},${tileY}`);
-            const color = TERRAIN_COLORS[info.terrain] || "n/a";
+            const color = info.biome === "lake"
+                ? TERRAIN_COLORS.lake
+                : (TERRAIN_COLORS[info.terrain] || "n/a");
 
             tooltip
                 .style("opacity", 1)
@@ -1862,10 +2059,15 @@
                     `Color: ${color}<br>` +
                     `x: ${tileX}, y: ${tileY}<br>` +
                     `Zone: ${info.zone}<br>` +
+                    `Water Body: ${info.waterBodyType || "none"}<br>` +
+                    `Ocean Connected: ${info.oceanConnectedWater ? "yes" : "no"}<br>` +
                     `Elevation: ${info.elevation.toFixed(3)}<br>` +
                     `Moisture: ${info.moisture.toFixed(3)}<br>` +
                     `Temp: ${info.temperature.toFixed(3)}<br>` +
                     `Ridge: ${info.ridge.toFixed(3)}<br>` +
+                    `River: ${info.hasRiver ? "yes" : "no"}<br>` +
+                    `River Flow: ${(info.riverFlowWeight || 0).toFixed(2)}<br>` +
+                    `River Mask: ${info.riverDirectionMask || 0}<br>` +
                     `Path Tile: ${isPathTile ? "yes" : "no"}<br>` +
                     `Path Ocean Tile: ${isOceanReplacedPathTile ? "yes" : "no"}<br>` +
                     `Generated Paths: ${pathPreviewGeneratedCount}<br>` +
